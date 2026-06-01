@@ -140,6 +140,33 @@ def _save_tsne(features, labels, class_names, out_dir, name, cfg):
     if features.size == 0:
         return None
 
+    selected_classes = cfg.get('tsne_selected_classes')
+    if selected_classes:
+        class_to_idx = {cls_name: idx for idx, cls_name in enumerate(class_names)}
+        selected_indices = [
+            class_to_idx[cls_name]
+            for cls_name in selected_classes
+            if cls_name in class_to_idx
+        ]
+        missing = [cls_name for cls_name in selected_classes if cls_name not in class_to_idx]
+        if missing:
+            print(f'[warn] t-SNE selected classes not found: {missing}')
+        if not selected_indices:
+            print('[warn] No valid selected classes for t-SNE; skip t-SNE.')
+            return None
+
+        selected_set = set(selected_indices)
+        mask = np.array([label in selected_set for label in labels], dtype=bool)
+        features = features[mask]
+        labels = labels[mask]
+        class_names = [class_names[idx] for idx in selected_indices]
+        remap = {old_idx: new_idx for new_idx, old_idx in enumerate(selected_indices)}
+        labels = np.array([remap[int(label)] for label in labels], dtype=np.int64)
+
+        if features.size == 0:
+            print('[warn] No query features matched selected t-SNE classes.')
+            return None
+
     max_points = int(cfg.get('tsne_max_points', 1000))
     if len(features) > max_points:
         rng = np.random.default_rng(cfg.get('seed', 24))
@@ -170,22 +197,22 @@ def _save_tsne(features, labels, class_names, out_dir, name, cfg):
         ).fit_transform(features)
 
         fig, ax = plt.subplots(figsize=(9, 7), dpi=180)
-        cmap = plt.get_cmap('gist_ncar')
+        cmap = plt.get_cmap('tab10')
         for cls_idx, cls_name in enumerate(class_names):
             mask = labels == cls_idx
             if not np.any(mask):
                 continue
-            color_pos = cls_idx / max(len(class_names) - 1, 1)
             ax.scatter(
                 embedding[mask, 0],
                 embedding[mask, 1],
                 s=12,
                 alpha=0.75,
-                color=cmap(color_pos),
+                color=cmap(cls_idx % 10),
                 label=cls_name,
                 linewidths=0,
             )
-        ax.set_title('t-SNE of Meta-test Query Features')
+        title_suffix = 'Selected Classes' if selected_classes else 'All Classes'
+        ax.set_title(f't-SNE of Meta-test Query Features ({title_suffix})')
         ax.set_xlabel('t-SNE 1')
         ax.set_ylabel('t-SNE 2')
         ax.grid(alpha=0.18)

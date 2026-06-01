@@ -26,10 +26,10 @@ PU_CONFIG = {
 
     # ==================== 工况划分配置 ====================
     # 源域工况：用于 meta-train。这里使用多源工况训练，提高任务多样性。
-    'source_condition': ['N09_M07_F10', 'N15_M07_F04', 'N15_M07_F10'],
+    'source_condition': ['N15_M07_F04', 'N15_M07_F10', 'N15_M01_F10'],
 
     # 目标域工况：用于 validation/test。该工况内部再按类别划分验证集和测试集。
-    'target_condition': 'N15_M01_F10',
+    'target_condition': 'N09_M07_F10',
 
     # 目标域每个类别中，多少比例样本用于 validation，剩余用于 test。
     'target_val_ratio': 0.5,
@@ -104,7 +104,8 @@ PU_CONFIG = {
     'outer_lr': 0.005,
 
     # 正式训练轮数。
-    'epochs': 500,
+    'epochs': 1000,
+
 
     # 每轮可采样任务数量。
     'tasks_per_epoch': 1000,
@@ -113,7 +114,7 @@ PU_CONFIG = {
     'meta_batch_size': 16,
 
     # 测试阶段 episode 数量。
-    'test_meta_batch_size': 100,
+    'test_meta_batch_size': 1000,
 
     # 测试阶段每个 episode 在 support 集上的内循环适应步数。
     'test_inner_steps': 10,
@@ -139,6 +140,10 @@ PU_CONFIG = {
 
     # t-SNE perplexity。实际运行时会根据样本数自动修正到合法范围。
     'tsne_perplexity': 30,
+
+    # t-SNE 只展示指定的 5 个原始故障类别，避免 32 类同时显示过于杂乱。
+    # 如果想换展示类别，直接改这里的类别名即可，类别名必须与 pu_data_processed 下的文件夹名一致。
+    'tsne_selected_classes': ['K001', 'KA01', 'KA07', 'KB23', 'KI16'],
 }
 
 # 快速冒烟测试开关。也可以通过运行脚本的 --quick 参数临时启用。
