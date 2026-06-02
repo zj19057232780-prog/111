@@ -11,7 +11,7 @@ import torch
 from config_pu import PU_CONFIG, QUICK_TEST
 from l2l_shim import MAML as MAMLAlgo
 from l2l_shim import MetaDataset, TaskDataset
-from maml_model import Net4CNN
+from maml_model import Net4CNN, Net4LSK
 from my_utils.init_utils import seed_torch
 from my_utils.train_utils import accuracy
 
@@ -226,7 +226,16 @@ def _save_tsne(features, labels, class_names, out_dir, name, cfg):
         return None
 
 
-def _save_test_visualizations(features, y_true, y_pred, rows, class_names, load_path, cfg):
+def _save_test_visualizations(
+    features,
+    y_true,
+    y_pred,
+    rows,
+    class_names,
+    load_path,
+    cfg,
+    tsne_payload=None,
+):
     if not cfg.get('save_visualizations', True):
         return
 
@@ -234,7 +243,11 @@ def _save_test_visualizations(features, y_true, y_pred, rows, class_names, load_
     name = _artifact_name(load_path)
     prediction_csv = _save_prediction_rows(rows, out_dir, name)
     cm_csv, cm_png = _save_confusion_matrix(y_true, y_pred, class_names, out_dir, name)
-    tsne_png = _save_tsne(features, y_true, class_names, out_dir, name, cfg)
+    if tsne_payload is not None:
+        tsne_features, tsne_labels, tsne_class_names = tsne_payload
+        tsne_png = _save_tsne(tsne_features, tsne_labels, tsne_class_names, out_dir, name, cfg)
+    else:
+        tsne_png = _save_tsne(features, y_true, class_names, out_dir, name, cfg)
 
     print(f'Saved test predictions: {prediction_csv}')
     print(f'Saved confusion matrix CSV: {cm_csv}')
@@ -250,14 +263,30 @@ class MAML_learner(object):
         layers = 4
         img_size = cfg.get('img_size', 64)
         in_channels = cfg.get('in_channels', 1)
-        feat_size = hidden_size * (img_size // (2 ** layers)) ** 2
-        self.model = Net4CNN(
-            output_size=ways,
-            hidden_size=hidden_size,
-            layers=layers,
-            channels=in_channels,
-            embedding_size=feat_size,
-        ).to(device)
+        backbone = cfg.get('backbone', 'cnn4').lower()
+
+        if backbone in ('lsk', 'lsk_lite', 'lsklite'):
+            self.model = Net4LSK(
+                output_size=ways,
+                channels=in_channels,
+                stage_channels=cfg.get('lsk_stage_channels', (32, 64, 96)),
+                stage_depths=cfg.get('lsk_stage_depths', (1, 1, 1)),
+                mlp_ratio=cfg.get('lsk_mlp_ratio', 2),
+            ).to(device)
+            self.backbone_name = 'lsk_lite'
+        elif backbone == 'cnn4':
+            feat_size = hidden_size * (img_size // (2 ** layers)) ** 2
+            self.model = Net4CNN(
+                output_size=ways,
+                hidden_size=hidden_size,
+                layers=layers,
+                channels=in_channels,
+                embedding_size=feat_size,
+            ).to(device)
+            self.backbone_name = 'cnn4'
+        else:
+            raise ValueError(f'Unknown backbone: {backbone}')
+
         self.ways = ways
         self.pu_config = pu_config or PU_CONFIG
         self._pu_storage = None
@@ -304,6 +333,81 @@ class MAML_learner(object):
             filter_labels=filter_labels,
         )
 
+    def build_fixed_selected_class_task(self, shots=1):
+        cfg = self.pu_config
+        selected_classes = cfg.get('tsne_selected_classes')
+        if not selected_classes:
+            return None
+
+        storage = self._get_pu_storage()
+        rng = np.random.default_rng(cfg.get('seed', 24))
+        support_x, support_y = [], []
+        query_x, query_y = [], []
+        used_classes = []
+
+        for cls_name in selected_classes:
+            cls_data = storage.target_test_data.get(cls_name)
+            if cls_data is None:
+                print(f'[warn] fixed t-SNE class not found in target test data: {cls_name}')
+                continue
+            if len(cls_data) <= shots:
+                print(f'[warn] fixed t-SNE class has too few samples: {cls_name}')
+                continue
+
+            new_label = len(used_classes)
+            used_classes.append(cls_name)
+            indices = np.arange(len(cls_data))
+            rng.shuffle(indices)
+            support_indices = indices[:shots]
+            query_indices = indices[shots:]
+
+            for idx in support_indices:
+                support_x.append(torch.from_numpy(np.ascontiguousarray(cls_data[idx])).float())
+                support_y.append(new_label)
+            for idx in query_indices:
+                query_x.append(torch.from_numpy(np.ascontiguousarray(cls_data[idx])).float())
+                query_y.append(new_label)
+
+        if len(used_classes) < 2 or not query_x:
+            print('[warn] fixed selected-class t-SNE task is too small; skip fixed t-SNE.')
+            return None
+
+        return (
+            torch.stack(support_x),
+            torch.tensor(support_y, dtype=torch.long),
+            torch.stack(query_x),
+            torch.tensor(query_y, dtype=torch.long),
+            used_classes,
+        )
+
+    def fixed_selected_class_tsne_payload(self, inner_steps=10, shots=1):
+        fixed_task = self.build_fixed_selected_class_task(shots=shots)
+        if fixed_task is None:
+            return None
+
+        support_x, support_y, query_x, query_y, used_classes = fixed_task
+        task = (support_x, support_y, query_x, query_y)
+        cfg = self.pu_config
+        maml = MAMLAlgo(self.model, lr=cfg.get('inner_lr', 0.05))
+        loss = torch.nn.CrossEntropyLoss(reduction='mean')
+        learner = maml.clone()
+        _, fixed_acc, features, labels, _ = self.fast_adapt(
+            task,
+            learner,
+            loss,
+            inner_steps,
+            return_predictions=True,
+        )
+        print(
+            f'Fixed selected-class t-SNE task: classes={used_classes}, '
+            f'query_samples={len(query_y)}, acc={fixed_acc.item():.4f}'
+        )
+        return (
+            features.detach().cpu().numpy(),
+            labels.detach().cpu().numpy(),
+            used_classes,
+        )
+
     @staticmethod
     def fast_adapt(batch, learner, loss, adaptation_steps, return_predictions=False):
         support_data, support_labels, query_data, query_labels = batch
@@ -339,7 +443,7 @@ class MAML_learner(object):
         adaptation_steps = cfg.get('adaptation_steps', {}).get(shots, 1)
 
         print(
-            f'Train STFT-CNN4-MAML: {train_ways}-way {shots}-shot '
+            f'Train STFT-{self.backbone_name}-MAML: {train_ways}-way {shots}-shot '
             f'{queries}-query, epochs={epochs}, meta_batch={meta_batch_size}'
         )
 
@@ -494,6 +598,10 @@ class MAML_learner(object):
         print(f'Meta Test Accuracy: {meta_test_accuracy / meta_batch_size:.4f}')
 
         if all_features:
+            tsne_payload = self.fixed_selected_class_tsne_payload(
+                inner_steps=inner_steps,
+                shots=shots,
+            )
             _save_test_visualizations(
                 features=np.concatenate(all_features, axis=0),
                 y_true=np.concatenate(all_true, axis=0),
@@ -502,6 +610,7 @@ class MAML_learner(object):
                 class_names=class_names,
                 load_path=load_path,
                 cfg=cfg,
+                tsne_payload=tsne_payload,
             )
 
 
@@ -510,7 +619,8 @@ def main():
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--test', action='store_true')
     parser.add_argument('--quick', action='store_true')
-    parser.add_argument('--model_path', default=r'.\model_save\STFT_CNN4_MAML')
+    default_model_name = PU_CONFIG.get('model_name', 'STFT_CNN4_MAML')
+    parser.add_argument('--model_path', default=os.path.join('.', 'model_save', default_model_name))
     args = parser.parse_args()
 
     seed_torch(PU_CONFIG.get('seed', 24))
@@ -519,6 +629,7 @@ def main():
         f'Input shape: [batch, {PU_CONFIG["in_channels"]}, '
         f'{PU_CONFIG["img_size"]}, {PU_CONFIG["img_size"]}]'
     )
+    print(f'Backbone: {PU_CONFIG.get("backbone", "cnn4")}')
 
     net = MAML_learner(ways=PU_CONFIG['n_way'], pu_config=PU_CONFIG)
     shots = PU_CONFIG['k_shot']

@@ -57,7 +57,7 @@ def main() -> None:
 
         seed_torch(cfg.get('seed', 24))
         net = MAML_learner(ways=cfg['n_way'], pu_config=cfg)
-        save_path = os.path.join('.', 'model_save', 'STFT_CNN4_MAML')
+        save_path = os.path.join('.', 'model_save', cfg.get('model_name', 'STFT_CNN4_MAML'))
         best_path = save_path + '_best'
 
         if args.train:

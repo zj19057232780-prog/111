@@ -1,8 +1,8 @@
 """
 帕德博恩轴承数据集（PU）上的 STFT-CNN4-MAML 基准模型配置文件。
 
-当前基准流程：
-原始 PU 振动信号 -> STFT 灰度时频图 -> CNN4Backbone 特征提取 -> MAML 少样本训练。
+当前流程：
+原始 PU 振动信号 -> STFT 灰度时频图 -> 可配置特征提取器（CNN4/LSK-lite）-> MAML 少样本训练。
 
 说明：
 1. 这里的 32 类是整个故障类别池。
@@ -26,10 +26,10 @@ PU_CONFIG = {
 
     # ==================== 工况划分配置 ====================
     # 源域工况：用于 meta-train。这里使用多源工况训练，提高任务多样性。
-    'source_condition': ['N15_M07_F04', 'N15_M07_F10', 'N15_M01_F10'],
+    'source_condition': ['N09_M07_F10', 'N15_M07_F04', 'N15_M07_F10'],
 
     # 目标域工况：用于 validation/test。该工况内部再按类别划分验证集和测试集。
-    'target_condition': 'N09_M07_F10',
+    'target_condition': 'N15_M01_F10',
 
     # 目标域每个类别中，多少比例样本用于 validation，剩余用于 test。
     'target_val_ratio': 0.5,
@@ -48,6 +48,24 @@ PU_CONFIG = {
 
     # 输入图片通道数。当前 STFT 图片为单通道灰度图。
     'in_channels': 1,
+
+    # ==================== 模型骨干配置 ====================
+    # backbone 可选：
+    # - 'cnn4'：原始基准模型，4 层传统 CNN。
+    # - 'lsk_lite'：模块 1，轻量化大核选择卷积网络，用于替换 CNN4。
+    'backbone': 'lsk_lite',
+
+    # 默认模型保存名前缀。使用 LSK-lite 时避免覆盖 CNN4 baseline 权重。
+    'model_name': 'STFT_LSKLite_MAML',
+
+    # LSK-lite 三个阶段的通道数。最后一个数也是 GAP 后的特征维度。
+    'lsk_stage_channels': (32, 64, 96),
+
+    # LSK-lite 每个阶段堆叠的 LSK block 数。先用轻量设置，适合 MAML。
+    'lsk_stage_depths': (1, 1, 1),
+
+    # LSK block 内 MLP 扩展倍率，越大参数越多。
+    'lsk_mlp_ratio': 2,
 
     # 每个样本从原始振动信号中截取的点数。
     'window_size': 4096,
@@ -104,7 +122,7 @@ PU_CONFIG = {
     'outer_lr': 0.005,
 
     # 正式训练轮数。
-    'epochs': 1000,
+    'epochs': 500,
 
 
     # 每轮可采样任务数量。
@@ -127,6 +145,8 @@ PU_CONFIG = {
 
     # 全局随机种子。改动后会影响 episode 采样和训练随机性。
     'seed': 24,
+
+
 
     # ==================== 可视化输出配置 ====================
     # 训练曲线、测试混淆矩阵、t-SNE 和预测明细的保存目录。

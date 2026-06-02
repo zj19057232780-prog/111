@@ -39,6 +39,13 @@ class SEAttention(nn.Module):
 
 def maml_init_(module):
     torch.nn.init.xavier_uniform_(module.weight.data, gain=1.0)
+    if module.bias is not None:
+        torch.nn.init.constant_(module.bias.data, 0.0)
+    return module
+
+
+def norm_init_(module):
+    torch.nn.init.constant_(module.weight.data, 1.0)
     torch.nn.init.constant_(module.bias.data, 0.0)
     return module
 
@@ -79,6 +86,148 @@ class CNN4Backbone(ConvBase):
         return x
 
 
+class ConvBNAct(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, groups=1, act=True):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            groups=groups,
+            bias=True,
+        )
+        self.norm = nn.BatchNorm2d(out_channels)
+        self.act = nn.GELU() if act else nn.Identity()
+        maml_init_(self.conv)
+        norm_init_(self.norm)
+
+    def forward(self, x):
+        return self.act(self.norm(self.conv(x)))
+
+
+class LSKSelectiveKernel(nn.Module):
+    """
+    Lightweight adaptation of LSKNet's large selective kernel block.
+
+    Reference:
+    C:/Users/JieZhang/Desktop/new-ifmaml/模块1LSK/LSKNet-main/LSKNet-main/
+    mmrotate/models/backbones/lsknet.py
+    """
+
+    def __init__(self, channels):
+        super().__init__()
+        reduced = max(channels // 2, 1)
+        self.conv5 = nn.Conv2d(channels, channels, 5, padding=2, groups=channels, bias=True)
+        self.conv7_dilated = nn.Conv2d(
+            channels,
+            channels,
+            7,
+            padding=9,
+            dilation=3,
+            groups=channels,
+            bias=True,
+        )
+        self.reduce5 = nn.Conv2d(channels, reduced, 1, bias=True)
+        self.reduce7 = nn.Conv2d(channels, reduced, 1, bias=True)
+        self.squeeze = nn.Conv2d(2, 2, 7, padding=3, bias=True)
+        self.expand = nn.Conv2d(reduced, channels, 1, bias=True)
+
+        for m in (self.conv5, self.conv7_dilated, self.reduce5, self.reduce7, self.squeeze, self.expand):
+            maml_init_(m)
+
+    def forward(self, x):
+        attn5 = self.conv5(x)
+        attn7 = self.conv7_dilated(attn5)
+
+        attn5 = self.reduce5(attn5)
+        attn7 = self.reduce7(attn7)
+        attn = torch.cat([attn5, attn7], dim=1)
+
+        avg_attn = torch.mean(attn, dim=1, keepdim=True)
+        max_attn, _ = torch.max(attn, dim=1, keepdim=True)
+        gate = torch.cat([avg_attn, max_attn], dim=1)
+        gate = self.squeeze(gate).sigmoid()
+
+        selected = attn5 * gate[:, 0:1, :, :] + attn7 * gate[:, 1:2, :, :]
+        selected = self.expand(selected)
+        return x * selected
+
+
+class LSKLiteBlock(nn.Module):
+    def __init__(self, channels, mlp_ratio=2):
+        super().__init__()
+        hidden = int(channels * mlp_ratio)
+        self.norm1 = nn.BatchNorm2d(channels)
+        self.proj1 = nn.Conv2d(channels, channels, 1, bias=True)
+        self.act = nn.GELU()
+        self.lsk = LSKSelectiveKernel(channels)
+        self.proj2 = nn.Conv2d(channels, channels, 1, bias=True)
+
+        self.norm2 = nn.BatchNorm2d(channels)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(channels, hidden, 1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(hidden, hidden, 3, padding=1, groups=hidden, bias=True),
+            nn.GELU(),
+            nn.Conv2d(hidden, channels, 1, bias=True),
+        )
+        self.layer_scale_1 = torch.nn.Parameter(1e-2 * torch.ones(channels))
+        self.layer_scale_2 = torch.nn.Parameter(1e-2 * torch.ones(channels))
+
+        norm_init_(self.norm1)
+        norm_init_(self.norm2)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d) and m not in self.lsk.modules():
+                maml_init_(m)
+
+    def forward(self, x):
+        residual = x
+        y = self.norm1(x)
+        y = self.proj1(y)
+        y = self.act(y)
+        y = self.lsk(y)
+        y = self.proj2(y)
+        x = residual + self.layer_scale_1.view(1, -1, 1, 1) * y
+
+        y = self.mlp(self.norm2(x))
+        x = x + self.layer_scale_2.view(1, -1, 1, 1) * y
+        return x
+
+
+class LSKLiteBackbone(nn.Module):
+    """
+    LSK-lite feature extractor for 64x64 STFT images.
+
+    It keeps the MAML interface identical to CNN4Backbone but replaces
+    fixed 3x3 convolution stacking with large-kernel selective convolution.
+    """
+
+    def __init__(self, channels=1, stage_channels=(32, 64, 96), stage_depths=(1, 1, 1), mlp_ratio=2):
+        super().__init__()
+        self.stem = ConvBNAct(channels, stage_channels[0], kernel_size=3, stride=2)
+
+        stages = []
+        in_channels = stage_channels[0]
+        for stage_idx, out_channels in enumerate(stage_channels):
+            if stage_idx > 0:
+                stages.append(ConvBNAct(in_channels, out_channels, kernel_size=3, stride=2))
+                in_channels = out_channels
+            blocks = [LSKLiteBlock(out_channels, mlp_ratio=mlp_ratio) for _ in range(stage_depths[stage_idx])]
+            stages.extend(blocks)
+        self.stages = nn.Sequential(*stages)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.embedding_size = stage_channels[-1]
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.stages(x)
+        x = self.pool(x).flatten(1)
+        return x
+
+
 class Net4CNN(torch.nn.Module):
     def __init__(self, output_size, hidden_size, layers, channels, embedding_size):
         super().__init__()
@@ -93,3 +242,29 @@ class Net4CNN(torch.nn.Module):
         x2 = self.classifier(x1)
         return x1,x2
         # return x
+
+
+class Net4LSK(torch.nn.Module):
+    def __init__(
+        self,
+        output_size,
+        channels=1,
+        stage_channels=(32, 64, 96),
+        stage_depths=(1, 1, 1),
+        mlp_ratio=2,
+    ):
+        super().__init__()
+        self.features = LSKLiteBackbone(
+            channels=channels,
+            stage_channels=tuple(stage_channels),
+            stage_depths=tuple(stage_depths),
+            mlp_ratio=mlp_ratio,
+        )
+        self.classifier = torch.nn.Linear(self.features.embedding_size, output_size, bias=True)
+        maml_init_(self.classifier)
+        self.embedding_size = self.features.embedding_size
+
+    def forward(self, x):
+        x1 = self.features(x)
+        x2 = self.classifier(x1)
+        return x1, x2
