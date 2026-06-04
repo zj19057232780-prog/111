@@ -272,8 +272,17 @@ class MAML_learner(object):
                 stage_channels=cfg.get('lsk_stage_channels', (32, 64, 96)),
                 stage_depths=cfg.get('lsk_stage_depths', (1, 1, 1)),
                 mlp_ratio=cfg.get('lsk_mlp_ratio', 2),
+                img_size=img_size,
+                frequency_module=cfg.get('frequency_module', 'none'),
+                gfnet_depth=cfg.get('gfnet_depth', 1),
+                gfnet_mlp_ratio=cfg.get('gfnet_mlp_ratio', 2),
+                gfnet_weight_scale=cfg.get('gfnet_weight_scale', 0.02),
+                gfnet_layer_scale_init=cfg.get('gfnet_layer_scale_init', 1e-2),
             ).to(device)
+            self.frequency_module = getattr(self.model, 'frequency_module', 'none')
             self.backbone_name = 'lsk_lite'
+            if self.frequency_module != 'none':
+                self.backbone_name = f'{self.backbone_name}_{self.frequency_module}'
         elif backbone == 'cnn4':
             feat_size = hidden_size * (img_size // (2 ** layers)) ** 2
             self.model = Net4CNN(
@@ -284,6 +293,7 @@ class MAML_learner(object):
                 embedding_size=feat_size,
             ).to(device)
             self.backbone_name = 'cnn4'
+            self.frequency_module = 'none'
         else:
             raise ValueError(f'Unknown backbone: {backbone}')
 
@@ -630,6 +640,7 @@ def main():
         f'{PU_CONFIG["img_size"]}, {PU_CONFIG["img_size"]}]'
     )
     print(f'Backbone: {PU_CONFIG.get("backbone", "cnn4")}')
+    print(f'Frequency module: {PU_CONFIG.get("frequency_module", "none")}')
 
     net = MAML_learner(ways=PU_CONFIG['n_way'], pu_config=PU_CONFIG)
     shots = PU_CONFIG['k_shot']

@@ -26,10 +26,10 @@ PU_CONFIG = {
 
     # ==================== 工况划分配置 ====================
     # 源域工况：用于 meta-train。这里使用多源工况训练，提高任务多样性。
-    'source_condition': ['N09_M07_F10', 'N15_M07_F04', 'N15_M07_F10'],
+    'source_condition': ['N15_M01_F10', 'N15_M07_F04', 'N15_M07_F10'],
 
     # 目标域工况：用于 validation/test。该工况内部再按类别划分验证集和测试集。
-    'target_condition': 'N15_M01_F10',
+    'target_condition': 'N09_M07_F10',
 
     # 目标域每个类别中，多少比例样本用于 validation，剩余用于 test。
     'target_val_ratio': 0.5,
@@ -55,8 +55,8 @@ PU_CONFIG = {
     # - 'lsk_lite'：模块 1，轻量化大核选择卷积网络，用于替换 CNN4。
     'backbone': 'lsk_lite',
 
-    # 默认模型保存名前缀。使用 LSK-lite 时避免覆盖 CNN4 baseline 权重。
-    'model_name': 'STFT_LSKLite_MAML',
+    # 默认模型保存名前缀。启用 GFNetLite 时避免覆盖 LSK-only 权重。
+    'model_name': 'STFT_LSKLite_GFNetLite_MAML',
 
     # LSK-lite 三个阶段的通道数。最后一个数也是 GAP 后的特征维度。
     'lsk_stage_channels': (32, 64, 96),
@@ -66,6 +66,24 @@ PU_CONFIG = {
 
     # LSK block 内 MLP 扩展倍率，越大参数越多。
     'lsk_mlp_ratio': 2,
+
+    # ==================== 频域增强模块配置 ====================
+    # frequency_module 可选：
+    # - 'none'：不启用频域增强，得到 STFT-LSKLite-MAML，用于消融对照。
+    # - 'gfnet_lite'：启用轻量 GFNet 全局频域滤波增强模块。
+    'frequency_module': 'gfnet_lite',
+
+    # GFNetLite 堆叠层数。先用 1 层，避免 MAML 训练过慢或过拟合。
+    'gfnet_depth': 1,
+
+    # GFNetLite 内部 MLP 扩展倍率。
+    'gfnet_mlp_ratio': 2,
+
+    # 可学习复数频域滤波器的初始化尺度，参考 GFNet 使用较小初始化。
+    'gfnet_weight_scale': 0.02,
+
+    # GFNetLite 残差分支缩放初值，较小值有助于稳定接入已跑通的 LSK 特征。
+    'gfnet_layer_scale_init': 1e-2,
 
     # 每个样本从原始振动信号中截取的点数。
     'window_size': 4096,
