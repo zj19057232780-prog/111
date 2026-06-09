@@ -278,11 +278,21 @@ class MAML_learner(object):
                 gfnet_mlp_ratio=cfg.get('gfnet_mlp_ratio', 2),
                 gfnet_weight_scale=cfg.get('gfnet_weight_scale', 0.02),
                 gfnet_layer_scale_init=cfg.get('gfnet_layer_scale_init', 1e-2),
+                attention_module=cfg.get('attention_module', 'none'),
+                ema_factor=cfg.get('ema_factor', 8),
+                ema_layer_scale_init=cfg.get('ema_layer_scale_init', 1e-3),
+                gcnet_ratio=cfg.get('gcnet_ratio', 0.25),
+                gcnet_pooling_type=cfg.get('gcnet_pooling_type', 'att'),
+                gcnet_fusion_types=cfg.get('gcnet_fusion_types', ('channel_add',)),
+                gcnet_layer_scale_init=cfg.get('gcnet_layer_scale_init', 1e-4),
             ).to(device)
             self.frequency_module = getattr(self.model, 'frequency_module', 'none')
+            self.attention_module = getattr(self.model, 'attention_module', 'none')
             self.backbone_name = 'lsk_lite'
             if self.frequency_module != 'none':
                 self.backbone_name = f'{self.backbone_name}_{self.frequency_module}'
+            if self.attention_module != 'none':
+                self.backbone_name = f'{self.backbone_name}_{self.attention_module}'
         elif backbone == 'cnn4':
             feat_size = hidden_size * (img_size // (2 ** layers)) ** 2
             self.model = Net4CNN(
@@ -294,6 +304,7 @@ class MAML_learner(object):
             ).to(device)
             self.backbone_name = 'cnn4'
             self.frequency_module = 'none'
+            self.attention_module = 'none'
         else:
             raise ValueError(f'Unknown backbone: {backbone}')
 
@@ -641,6 +652,7 @@ def main():
     )
     print(f'Backbone: {PU_CONFIG.get("backbone", "cnn4")}')
     print(f'Frequency module: {PU_CONFIG.get("frequency_module", "none")}')
+    print(f'Attention module: {PU_CONFIG.get("attention_module", "none")}')
 
     net = MAML_learner(ways=PU_CONFIG['n_way'], pu_config=PU_CONFIG)
     shots = PU_CONFIG['k_shot']

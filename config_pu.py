@@ -55,8 +55,8 @@ PU_CONFIG = {
     # - 'lsk_lite'：模块 1，轻量化大核选择卷积网络，用于替换 CNN4。
     'backbone': 'lsk_lite',
 
-    # 默认模型保存名前缀。启用 GFNetLite 时避免覆盖 LSK-only 权重。
-    'model_name': 'STFT_LSKLite_GFNetLite_MAML',
+    # 默认模型保存名前缀。启用 EMA-lite 时避免覆盖前序消融权重。
+    'model_name': 'STFT_LSKLite_GFNetLite_GCNet_MAML',
 
     # LSK-lite 三个阶段的通道数。最后一个数也是 GAP 后的特征维度。
     'lsk_stage_channels': (32, 64, 96),
@@ -84,6 +84,31 @@ PU_CONFIG = {
 
     # GFNetLite 残差分支缩放初值，较小值有助于稳定接入已跑通的 LSK 特征。
     'gfnet_layer_scale_init': 1e-2,
+
+    # ==================== 注意力模块配置 ====================
+    # attention_module 可选：
+    # - 'none'：不启用注意力模块，用于 LSK/GFNet 前序消融。
+    # - 'ema_lite'：启用轻量 EMA 跨空间多尺度注意力模块。
+    # - 'gcnet'：启用 GCNet 全局上下文模块，用于替代 EMA 做第三模块消融。
+    'attention_module': 'gcnet',
+
+    # EMA-lite 分组数。96 通道下默认 8 组，每组 12 通道，兼顾轻量和表达能力。
+    'ema_factor': 8,
+
+    # EMA-lite 残差分支缩放初值。先用较小值，降低对 GFNet/LSK 特征的初始扰动。
+    'ema_layer_scale_init': 1e-3,
+
+    # GCNet 通道压缩比例。96 通道下 0.25 对应 24 个上下文隐藏通道，参数量较小。
+    'gcnet_ratio': 0.125,
+
+    # GCNet 上下文池化方式：'att' 为注意力加权全局池化，'avg' 为平均池化。
+    'gcnet_pooling_type': 'att',
+
+    # GCNet 融合方式。默认只用 channel_add，初始近似恒等映射，比 channel_mul 更稳。
+    'gcnet_fusion_types': ('channel_mul',),
+
+    # GCNet 残差分支缩放初值。用于限制全局上下文分支后期过强，降低 loss 爆炸和 NaN 风险。
+    'gcnet_layer_scale_init': 1e-4,
 
     # 每个样本从原始振动信号中截取的点数。
     'window_size': 4096,
