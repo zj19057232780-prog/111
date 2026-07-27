@@ -26,8 +26,10 @@ def _artifact_name(path):
     return name or 'STFT_CNN4_MAML'
 
 
-def _visual_dir(cfg):
+def _visual_dir(cfg, artifact_path=None):
     out_dir = cfg.get('visualization_dir', './results')
+    if artifact_path:
+        out_dir = os.path.join(out_dir, _artifact_name(artifact_path))
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
 
@@ -36,7 +38,7 @@ def _save_training_history(history, save_path, cfg):
     if not history or not cfg.get('save_visualizations', True):
         return
 
-    out_dir = _visual_dir(cfg)
+    out_dir = _visual_dir(cfg, save_path)
     name = _artifact_name(save_path)
     csv_path = os.path.join(out_dir, f'{name}_training_history.csv')
     curve_path = os.path.join(out_dir, f'{name}_training_curves.png')
@@ -239,7 +241,7 @@ def _save_test_visualizations(
     if not cfg.get('save_visualizations', True):
         return
 
-    out_dir = _visual_dir(cfg)
+    out_dir = _visual_dir(cfg, load_path)
     name = _artifact_name(load_path)
     prediction_csv = _save_prediction_rows(rows, out_dir, name)
     cm_csv, cm_png = _save_confusion_matrix(y_true, y_pred, class_names, out_dir, name)

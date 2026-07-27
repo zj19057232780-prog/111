@@ -72,10 +72,10 @@ PU_CONFIG = {
 
     # ==================== 工况划分配置 ====================
     # 源域工况：用于 meta-train。这里使用多源工况训练，提高任务多样性。
-    'source_condition': ['N09_M07_F10', 'N15_M07_F04', 'N15_M07_F10'],
+    'source_condition': ['N15_M01_F10', 'N15_M07_F04', 'N15_M07_F10'],
 
     # 目标域工况：用于 validation/test。该工况内部再按类别划分验证集和测试集。
-    'target_condition': 'N15_M01_F10',
+    'target_condition': 'N09_M07_F10',
 
     # 目标域每个类别中，多少比例样本用于 validation，剩余用于 test。
     'target_val_ratio': 0.5,
@@ -262,7 +262,7 @@ PU_CONFIG = {
     },
 
     # 全局随机种子。改动后会影响 episode 采样和训练随机性。
-    'seed':81,
+    'seed':38,
 
 
 
