@@ -10,6 +10,8 @@ env/
 
 pu_data_mat/
 pu_data_processed/
+CWRU/
+cwru_data_processed/
 model_save/
 results/
 

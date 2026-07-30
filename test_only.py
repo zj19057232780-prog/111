@@ -30,6 +30,8 @@ def build_tasks(mode='train', ways=5, shots=5, num_tasks=1000, filter_labels=Non
         source_condition=cfg['source_condition'],
         target_condition=cfg['target_condition'],
         img_size=cfg.get('img_size', 64),
+        class_groups=cfg.get('class_groups'),
+        classification_name=cfg.get('classification_preset'),
     )
     base.prepare_data()
     base.set_mode(mode)

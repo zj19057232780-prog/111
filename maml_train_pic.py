@@ -26,8 +26,10 @@ def _artifact_name(path):
     return name or 'STFT_CNN4_MAML'
 
 
-def _visual_dir(cfg):
+def _visual_dir(cfg, artifact_path=None):
     out_dir = cfg.get('visualization_dir', './results')
+    if artifact_path:
+        out_dir = os.path.join(out_dir, _artifact_name(artifact_path))
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
 
@@ -36,7 +38,7 @@ def _save_training_history(history, save_path, cfg):
     if not history or not cfg.get('save_visualizations', True):
         return
 
-    out_dir = _visual_dir(cfg)
+    out_dir = _visual_dir(cfg, save_path)
     name = _artifact_name(save_path)
     csv_path = os.path.join(out_dir, f'{name}_training_history.csv')
     curve_path = os.path.join(out_dir, f'{name}_training_curves.png')
@@ -239,7 +241,7 @@ def _save_test_visualizations(
     if not cfg.get('save_visualizations', True):
         return
 
-    out_dir = _visual_dir(cfg)
+    out_dir = _visual_dir(cfg, load_path)
     name = _artifact_name(load_path)
     prediction_csv = _save_prediction_rows(rows, out_dir, name)
     cm_csv, cm_png = _save_confusion_matrix(y_true, y_pred, class_names, out_dir, name)
@@ -278,6 +280,9 @@ class MAML_learner(object):
                 gfnet_mlp_ratio=cfg.get('gfnet_mlp_ratio', 2),
                 gfnet_weight_scale=cfg.get('gfnet_weight_scale', 0.02),
                 gfnet_layer_scale_init=cfg.get('gfnet_layer_scale_init', 1e-2),
+                denoise_module=cfg.get('denoise_module', 'none'),
+                arsm_reduction=cfg.get('arsm_reduction', 4),
+                arsm_blend_init=cfg.get('arsm_blend_init', 1e-3),
                 attention_module=cfg.get('attention_module', 'none'),
                 ema_factor=cfg.get('ema_factor', 8),
                 ema_layer_scale_init=cfg.get('ema_layer_scale_init', 1e-3),
@@ -287,10 +292,13 @@ class MAML_learner(object):
                 gcnet_layer_scale_init=cfg.get('gcnet_layer_scale_init', 1e-4),
             ).to(device)
             self.frequency_module = getattr(self.model, 'frequency_module', 'none')
+            self.denoise_module = getattr(self.model, 'denoise_module', 'none')
             self.attention_module = getattr(self.model, 'attention_module', 'none')
             self.backbone_name = 'lsk_lite'
             if self.frequency_module != 'none':
                 self.backbone_name = f'{self.backbone_name}_{self.frequency_module}'
+            if self.denoise_module != 'none':
+                self.backbone_name = f'{self.backbone_name}_{self.denoise_module}'
             if self.attention_module != 'none':
                 self.backbone_name = f'{self.backbone_name}_{self.attention_module}'
         elif backbone == 'cnn4':
@@ -304,6 +312,7 @@ class MAML_learner(object):
             ).to(device)
             self.backbone_name = 'cnn4'
             self.frequency_module = 'none'
+            self.denoise_module = 'none'
             self.attention_module = 'none'
         else:
             raise ValueError(f'Unknown backbone: {backbone}')
@@ -324,6 +333,8 @@ class MAML_learner(object):
                 img_size=cfg.get('img_size', 64),
                 target_val_ratio=cfg.get('target_val_ratio', 0.5),
                 split_seed=cfg.get('seed', 24),
+                class_groups=cfg.get('class_groups'),
+                classification_name=cfg.get('classification_preset'),
             )
         return self._pu_storage
 
@@ -340,6 +351,8 @@ class MAML_learner(object):
             img_size=cfg.get('img_size', 64),
             target_val_ratio=cfg.get('target_val_ratio', 0.5),
             split_seed=cfg.get('seed', 24),
+            class_groups=cfg.get('class_groups'),
+            classification_name=cfg.get('classification_preset'),
             share_storage=storage,
         )
         ds.set_mode(mode)
@@ -462,10 +475,23 @@ class MAML_learner(object):
         epochs = 3 if quick_test else cfg.get('epochs', 250)
         meta_batch_size = 4 if quick_test else cfg.get('meta_batch_size', 16)
         adaptation_steps = cfg.get('adaptation_steps', {}).get(shots, 1)
+        grad_clip_norm = cfg.get('outer_grad_clip_norm')
+        scheduler_name = str(cfg.get('outer_lr_scheduler', 'none')).lower()
+        if scheduler_name in ('none', 'off', 'false'):
+            scheduler = None
+        elif scheduler_name == 'cosine':
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt,
+                T_max=max(epochs, 1),
+                eta_min=cfg.get('outer_lr_min', 0.0),
+            )
+        else:
+            raise ValueError(f'Unknown outer_lr_scheduler: {scheduler_name}')
 
         print(
             f'Train STFT-{self.backbone_name}-MAML: {train_ways}-way {shots}-shot '
-            f'{queries}-query, epochs={epochs}, meta_batch={meta_batch_size}'
+            f'{queries}-query, epochs={epochs}, meta_batch={meta_batch_size}, '
+            f'outer_lr={meta_lr}, scheduler={scheduler_name}, grad_clip={grad_clip_norm}'
         )
 
         train_tasks = self.build_tasks('train', train_ways, shots, queries, num_tasks)
@@ -478,6 +504,7 @@ class MAML_learner(object):
 
         for ep in range(epochs):
             t0 = time.time()
+            current_lr = opt.param_groups[0]['lr']
             meta_train_error = 0.0
             meta_train_accuracy = 0.0
             meta_valid_error = 0.0
@@ -505,7 +532,29 @@ class MAML_learner(object):
             for p in maml.parameters():
                 if p.grad is not None:
                     p.grad.data.mul_(1.0 / meta_batch_size)
-            opt.step()
+            if grad_clip_norm is not None and float(grad_clip_norm) > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    maml.parameters(),
+                    max_norm=float(grad_clip_norm),
+                    error_if_nonfinite=False,
+                )
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    maml.parameters(),
+                    max_norm=float('inf'),
+                    error_if_nonfinite=False,
+                )
+
+            grad_norm_value = float(grad_norm.detach().cpu())
+            if np.isfinite(grad_norm_value):
+                opt.step()
+            else:
+                print(
+                    f'[warn] Epoch {ep + 1}: non-finite outer gradient; '
+                    'optimizer step skipped.'
+                )
+            if scheduler is not None:
+                scheduler.step()
 
             avg_train_acc = meta_train_accuracy / meta_batch_size
             avg_valid_acc = meta_valid_accuracy / meta_batch_size
@@ -520,6 +569,8 @@ class MAML_learner(object):
                 'valid_loss': avg_valid_err,
                 'valid_acc': avg_valid_acc,
                 'epoch_seconds': epoch_seconds,
+                'outer_lr': current_lr,
+                'outer_grad_norm': grad_norm_value,
                 'best_valid_acc': max(best_valid_acc, avg_valid_acc),
                 'best_epoch': ep + 1 if avg_valid_acc > best_valid_acc else best_epoch,
             })
@@ -529,6 +580,7 @@ class MAML_learner(object):
                 f'time={epoch_seconds:.2f}s | '
                 f'train_loss={avg_train_err:.4f} acc={avg_train_acc:.4f} | '
                 f'valid_loss={avg_valid_err:.4f} acc={avg_valid_acc:.4f} | '
+                f'lr={current_lr:.6f} grad={grad_norm_value:.3f} | '
                 f'best={best_valid_acc:.4f}@{best_epoch}'
             )
 
@@ -652,7 +704,12 @@ def main():
     )
     print(f'Backbone: {PU_CONFIG.get("backbone", "cnn4")}')
     print(f'Frequency module: {PU_CONFIG.get("frequency_module", "none")}')
+    print(f'Denoise module: {PU_CONFIG.get("denoise_module", "none")}')
     print(f'Attention module: {PU_CONFIG.get("attention_module", "none")}')
+    print(
+        f'Classification preset: {PU_CONFIG.get("classification_preset")} | '
+        f'pool={len(PU_CONFIG.get("class_groups", {}))} classes'
+    )
 
     net = MAML_learner(ways=PU_CONFIG['n_way'], pu_config=PU_CONFIG)
     shots = PU_CONFIG['k_shot']
