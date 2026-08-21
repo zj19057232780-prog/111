@@ -79,9 +79,12 @@ class PUMetaDataset(data.Dataset):
     """
     In-memory PU STFT image dataset for MAML.
 
-    train: source conditions
-    validation: held-out split of the target condition
-    test: separate held-out split of the target condition
+    ``class_groups`` maps semantic class names to one or more bearing IDs. Images
+    from bearing IDs in the same group are concatenated into one MAML class.
+
+    - train: merged data from all configured source conditions
+    - validation: held-out split of the target condition, used for checkpoint selection
+    - test: separate target split, loaded by the same storage but never used for gradients
     """
 
     def __init__(

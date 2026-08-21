@@ -3,10 +3,18 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import random
 import time
+from collections import OrderedDict
+from contextlib import contextmanager
 
 import numpy as np
 import torch
+
+try:
+    from torch.func import functional_call
+except ImportError:
+    from torch.nn.utils.stateless import functional_call
 
 from config_pu import PU_CONFIG, QUICK_TEST
 from l2l_shim import MAML as MAMLAlgo
@@ -17,6 +25,140 @@ from my_utils.train_utils import accuracy
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+def cap_and_renormalize_weights(weights, max_weight, eps=1e-12):
+    """Cap oversized task weights and redistribute the excess until sum(weights)=1."""
+    weights = weights.clone()
+
+    if weights.ndim != 1 or weights.numel() == 0:
+        raise ValueError('Task weights must be a non-empty 1D tensor.')
+    if max_weight < 1.0 / weights.numel():
+        raise ValueError('max_weight must be >= uniform task weight.')
+    if not torch.isfinite(weights).all() or torch.any(weights < 0):
+        raise ValueError('Task weights must be finite and non-negative.')
+
+    locked = torch.zeros_like(weights, dtype=torch.bool)
+
+    for _ in range(weights.numel()):
+        over = (weights > max_weight) & (~locked)
+        if not torch.any(over):
+            break
+
+        locked |= over
+        weights[over] = max_weight
+
+        free = ~locked
+        remaining = 1.0 - weights[locked].sum()
+        if not torch.any(free):
+            break
+
+        free_sum = weights[free].sum()
+        if free_sum <= eps:
+            weights[free] = remaining / free.sum()
+        else:
+            weights[free] = weights[free] / free_sum * remaining
+
+    weights = weights / weights.sum().clamp_min(eps)
+    return weights
+
+
+def compute_ggm_rw_weights(
+    gaps,
+    epoch,
+    batch_size,
+    temperature=1.0,
+    alpha_max=0.20,
+    warmup_epochs=50,
+    z_clip=2.0,
+    max_ratio=3.0,
+    eps=1e-6,
+):
+    """
+    Convert detached per-task generalization gaps into bounded meta-batch weights.
+
+    A larger positive gap means that support adaptation fits the support set much
+    better than the query set. GGM-RW treats it as a relatively difficult task,
+    applies z-score normalization, clipping and softmax, then mixes the result
+    with uniform weights through a cosine warm-up. Returned weights sum to one,
+    are capped at ``max_ratio / batch_size`` and never create an extra gradient
+    path through the pilot calculation.
+    """
+    if len(gaps) != batch_size or batch_size <= 0:
+        raise ValueError('The number of pilot gaps must equal the meta-batch size.')
+    if temperature <= 0 or alpha_max < 0 or alpha_max > 1:
+        raise ValueError('temperature must be positive and alpha_max must be in [0, 1].')
+    if z_clip < 0 or max_ratio < 1 or eps <= 0:
+        raise ValueError('z_clip, max_ratio, or eps has an invalid value.')
+
+    gaps = torch.stack(gaps).float()
+    if not torch.isfinite(gaps).all():
+        raise ValueError('GGM-RW received a non-finite pilot gap.')
+
+    mean_gap = gaps.mean()
+    std_gap = gaps.std(unbiased=False)
+    z = (gaps - mean_gap) / (std_gap + eps)
+    z = torch.clamp(z, min=-z_clip, max=z_clip)
+    difficulty = torch.softmax(z / temperature, dim=0)
+
+    progress = min(float(epoch + 1) / float(max(warmup_epochs, 1)), 1.0)
+    alpha_t = alpha_max * 0.5 * (1.0 - np.cos(np.pi * progress))
+    weights = (1.0 - alpha_t) / batch_size + alpha_t * difficulty
+    weights = cap_and_renormalize_weights(
+        weights,
+        max_weight=max_ratio / batch_size,
+        eps=eps,
+    )
+
+    return weights.detach(), {
+        'gap_mean': mean_gap.item(),
+        'gap_std': std_gap.item(),
+        'weight_min': weights.min().item(),
+        'weight_max': weights.max().item(),
+        'alpha': float(alpha_t),
+    }
+
+
+@contextmanager
+def freeze_bn_running_stats(model):
+    """
+    Temporarily use train-mode batch statistics without changing BN running buffers.
+
+    This context is used only by the additional first-order GGM pilot. The formal
+    second-order MAML pass keeps the original remote-branch BatchNorm behavior.
+    """
+    states = []
+    for module in model.modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            states.append((module, module.track_running_stats))
+            module.track_running_stats = False
+
+    try:
+        yield
+    finally:
+        for module, old_state in states:
+            module.track_running_stats = old_state
+
+
+def capture_rng_state():
+    """Snapshot all RNG streams used by task/model computation before the GGM pilot."""
+    state = {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.random.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state['cuda'] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state):
+    """Restore RNG streams so the pilot itself does not alter subsequent randomness."""
+    random.setstate(state['python'])
+    np.random.set_state(state['numpy'])
+    torch.random.set_rng_state(state['torch'])
+    if torch.cuda.is_available() and 'cuda' in state:
+        torch.cuda.set_rng_state_all(state['cuda'])
 
 
 def _artifact_name(path):
@@ -461,6 +603,53 @@ class MAML_learner(object):
             return valid_error, valid_accuracy, features, query_labels, predictions
         return valid_error, valid_accuracy, features, query_labels
 
+    @staticmethod
+    def pilot_generalization_gap(task, model, loss, adaptation_steps, inner_lr):
+        """
+        Estimate ``max(0, query_loss - post_adaptation_support_loss)`` for one task.
+
+        The pilot clones detached parameters and uses first-order inner updates,
+        so it is cheaper than the formal second-order MAML pass and cannot update
+        the base model. Its output is used only as a detached weighting signal.
+        """
+        support_data, support_labels, query_data, query_labels = task
+        support_data = support_data.to(device)
+        support_labels = support_labels.to(device)
+        query_data = query_data.to(device)
+        query_labels = query_labels.to(device)
+
+        fast_params = OrderedDict(
+            (name, param.detach().clone().requires_grad_(True))
+            for name, param in model.named_parameters()
+        )
+
+        for _ in range(adaptation_steps):
+            _, support_logits = functional_call(model, fast_params, (support_data,))
+            support_loss = loss(support_logits, support_labels)
+            grads = torch.autograd.grad(
+                support_loss,
+                tuple(fast_params.values()),
+                create_graph=False,
+                retain_graph=False,
+            )
+            fast_params = OrderedDict(
+                (
+                    name,
+                    (param - inner_lr * grad).detach().requires_grad_(True),
+                )
+                for (name, param), grad in zip(fast_params.items(), grads)
+            )
+
+        _, support_logits_post = functional_call(
+            model,
+            fast_params,
+            (support_data,),
+        )
+        support_loss_post = loss(support_logits_post, support_labels)
+        _, query_logits = functional_call(model, fast_params, (query_data,))
+        query_loss = loss(query_logits, query_labels)
+        return torch.relu(query_loss - support_loss_post).detach()
+
     def train(self, save_path, shots=1, quick_test=False):
         cfg = self.pu_config
         meta_lr = cfg.get('outer_lr', 0.005)
@@ -475,6 +664,9 @@ class MAML_learner(object):
         epochs = 3 if quick_test else cfg.get('epochs', 250)
         meta_batch_size = 4 if quick_test else cfg.get('meta_batch_size', 16)
         adaptation_steps = cfg.get('adaptation_steps', {}).get(shots, 1)
+        weighting_mode = cfg.get('task_weighting_mode', 'none').lower()
+        if weighting_mode not in ('none', 'ggm_rw'):
+            raise ValueError(f'Unknown task_weighting_mode: {weighting_mode}')
         grad_clip_norm = cfg.get('outer_grad_clip_norm')
         scheduler_name = str(cfg.get('outer_lr_scheduler', 'none')).lower()
         if scheduler_name in ('none', 'off', 'false'):
@@ -491,7 +683,8 @@ class MAML_learner(object):
         print(
             f'Train STFT-{self.backbone_name}-MAML: {train_ways}-way {shots}-shot '
             f'{queries}-query, epochs={epochs}, meta_batch={meta_batch_size}, '
-            f'outer_lr={meta_lr}, scheduler={scheduler_name}, grad_clip={grad_clip_norm}'
+            f'outer_lr={meta_lr}, scheduler={scheduler_name}, '
+            f'grad_clip={grad_clip_norm}, task_weighting={weighting_mode}'
         )
 
         train_tasks = self.build_tasks('train', train_ways, shots, queries, num_tasks)
@@ -511,16 +704,59 @@ class MAML_learner(object):
             meta_valid_accuracy = 0.0
 
             opt.zero_grad()
-            for _ in range(meta_batch_size):
+            train_batch = [
+                train_tasks.sample()
+                for _ in range(meta_batch_size)
+            ]
+
+            # GGM-RW first evaluates exactly the same task batch with an isolated,
+            # first-order pilot. RNG restoration prevents this extra pass from
+            # changing stochastic behavior in the formal second-order pass.
+            if weighting_mode == 'ggm_rw':
+                rng_state = capture_rng_state()
+                pilot_gaps = []
+                try:
+                    with freeze_bn_running_stats(self.model):
+                        for task in train_batch:
+                            pilot_gaps.append(self.pilot_generalization_gap(
+                                task=task,
+                                model=self.model,
+                                loss=loss,
+                                adaptation_steps=adaptation_steps,
+                                inner_lr=fast_lr,
+                            ))
+                finally:
+                    restore_rng_state(rng_state)
+
+                task_weights, ggm_stats = compute_ggm_rw_weights(
+                    gaps=pilot_gaps,
+                    epoch=ep,
+                    batch_size=meta_batch_size,
+                    temperature=cfg.get('task_weight_temperature', 1.0),
+                    alpha_max=cfg.get('task_weight_alpha_max', 0.20),
+                    warmup_epochs=cfg.get('task_weight_warmup_epochs', 50),
+                    z_clip=cfg.get('task_weight_z_clip', 2.0),
+                    max_ratio=cfg.get('task_weight_max_ratio', 3.0),
+                    eps=cfg.get('task_weight_eps', 1e-6),
+                )
+            else:
+                task_weights = None
+                ggm_stats = None
+
+            for task_idx, task in enumerate(train_batch):
                 learner = maml.clone()
-                task = train_tasks.sample()
                 evaluation_error, evaluation_accuracy, _, _ = self.fast_adapt(
                     task, learner, loss, adaptation_steps
                 )
-                evaluation_error.backward()
+                if weighting_mode == 'ggm_rw':
+                    weighted_error = task_weights[task_idx] * evaluation_error
+                    weighted_error.backward()
+                else:
+                    evaluation_error.backward()
                 meta_train_error += evaluation_error.item()
                 meta_train_accuracy += evaluation_accuracy.item()
 
+            for _ in range(meta_batch_size):
                 learner = maml.clone()
                 task = valid_tasks.sample()
                 evaluation_error, evaluation_accuracy, _, _ = self.fast_adapt(
@@ -529,9 +765,15 @@ class MAML_learner(object):
                 meta_valid_error += evaluation_error.item()
                 meta_valid_accuracy += evaluation_accuracy.item()
 
-            for p in maml.parameters():
-                if p.grad is not None:
-                    p.grad.data.mul_(1.0 / meta_batch_size)
+            # Standard MAML accumulates B unscaled task losses and divides the
+            # resulting gradients by B. GGM weights already sum to one, so an
+            # additional division would make its effective learning rate B times smaller.
+            if weighting_mode == 'none':
+                for p in maml.parameters():
+                    if p.grad is not None:
+                        p.grad.data.mul_(1.0 / meta_batch_size)
+
+            # Clip the fully aggregated outer gradient for both none and GGM-RW.
             if grad_clip_norm is not None and float(grad_clip_norm) > 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     maml.parameters(),
@@ -562,7 +804,7 @@ class MAML_learner(object):
             avg_valid_err = meta_valid_error / meta_batch_size
             epoch_seconds = time.time() - t0
 
-            history.append({
+            history_row = {
                 'epoch': ep + 1,
                 'train_loss': avg_train_err,
                 'train_acc': avg_train_acc,
@@ -573,9 +815,18 @@ class MAML_learner(object):
                 'outer_grad_norm': grad_norm_value,
                 'best_valid_acc': max(best_valid_acc, avg_valid_acc),
                 'best_epoch': ep + 1 if avg_valid_acc > best_valid_acc else best_epoch,
-            })
+            }
+            if ggm_stats is not None:
+                history_row.update({
+                    'ggm_gap_mean': ggm_stats['gap_mean'],
+                    'ggm_gap_std': ggm_stats['gap_std'],
+                    'ggm_weight_min': ggm_stats['weight_min'],
+                    'ggm_weight_max': ggm_stats['weight_max'],
+                    'ggm_alpha': ggm_stats['alpha'],
+                })
+            history.append(history_row)
 
-            print(
+            epoch_message = (
                 f'Epoch {ep + 1:03d} | '
                 f'time={epoch_seconds:.2f}s | '
                 f'train_loss={avg_train_err:.4f} acc={avg_train_acc:.4f} | '
@@ -583,6 +834,13 @@ class MAML_learner(object):
                 f'lr={current_lr:.6f} grad={grad_norm_value:.3f} | '
                 f'best={best_valid_acc:.4f}@{best_epoch}'
             )
+            if ggm_stats is not None:
+                epoch_message += (
+                    f' | gap={ggm_stats["gap_mean"]:.4f}±{ggm_stats["gap_std"]:.4f} '
+                    f'w=[{ggm_stats["weight_min"]:.4f},{ggm_stats["weight_max"]:.4f}] '
+                    f'alpha={ggm_stats["alpha"]:.4f}'
+                )
+            print(epoch_message)
 
             if avg_valid_acc > best_valid_acc:
                 best_valid_acc = avg_valid_acc
@@ -706,6 +964,7 @@ def main():
     print(f'Frequency module: {PU_CONFIG.get("frequency_module", "none")}')
     print(f'Denoise module: {PU_CONFIG.get("denoise_module", "none")}')
     print(f'Attention module: {PU_CONFIG.get("attention_module", "none")}')
+    print(f'Task weighting: {PU_CONFIG.get("task_weighting_mode", "none")}')
     print(
         f'Classification preset: {PU_CONFIG.get("classification_preset")} | '
         f'pool={len(PU_CONFIG.get("class_groups", {}))} classes'
