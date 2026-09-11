@@ -53,13 +53,38 @@ def _split_target_class_data(data_arr, val_ratio=0.5, seed=24):
     return data_arr[val_idx], data_arr[test_idx]
 
 
+def _normalize_class_groups(class_groups):
+    if class_groups is None:
+        return None
+    if not isinstance(class_groups, dict) or not class_groups:
+        raise ValueError('class_groups must be a non-empty dict or None')
+
+    normalized = {}
+    used_bearings = set()
+    for class_name, bearing_ids in class_groups.items():
+        members = list(bearing_ids)
+        if not members:
+            raise ValueError(f'Classification group is empty: {class_name}')
+        duplicates = used_bearings.intersection(members)
+        if duplicates:
+            raise ValueError(
+                f'Bearing IDs assigned to multiple groups: {sorted(duplicates)}'
+            )
+        used_bearings.update(members)
+        normalized[str(class_name)] = members
+    return normalized
+
+
 class PUMetaDataset(data.Dataset):
     """
     In-memory PU STFT image dataset for MAML.
 
-    train: source conditions
-    validation: held-out split of the target condition
-    test: separate held-out split of the target condition
+    ``class_groups`` maps semantic class names to one or more bearing IDs. Images
+    from bearing IDs in the same group are concatenated into one MAML class.
+
+    - train: merged data from all configured source conditions
+    - validation: held-out split of the target condition, used for checkpoint selection
+    - test: separate target split, loaded by the same storage but never used for gradients
     """
 
     def __init__(
@@ -70,6 +95,8 @@ class PUMetaDataset(data.Dataset):
         img_size=64,
         target_val_ratio=0.5,
         split_seed=24,
+        class_groups=None,
+        classification_name=None,
         share_storage=None,
     ):
         super().__init__()
@@ -80,6 +107,8 @@ class PUMetaDataset(data.Dataset):
         self.width = img_size
         self.target_val_ratio = target_val_ratio
         self.split_seed = split_seed
+        self.class_groups = _normalize_class_groups(class_groups)
+        self.classification_name = classification_name or 'bearing_id'
         self._share = share_storage
 
         self.source_classes = []
@@ -99,6 +128,8 @@ class PUMetaDataset(data.Dataset):
             self.target_val_data = self._share.target_val_data
             self.target_test_data = self._share.target_test_data
             self.num_classes = self._share.num_classes
+            self.class_groups = self._share.class_groups
+            self.classification_name = self._share.classification_name
         else:
             self.prepare_data()
 
@@ -113,21 +144,38 @@ class PUMetaDataset(data.Dataset):
             return
 
         target_dir = os.path.join(self.root_path, self.target_condition)
-        self.target_classes = self._list_class_dirs(target_dir)
-        if not self.target_classes:
+        target_bearings = self._list_class_dirs(target_dir)
+        if not target_bearings:
             raise FileNotFoundError(f'No target class directories found: {target_dir}')
+
+        if self.class_groups is None:
+            self.class_groups = {
+                bearing_id: [bearing_id] for bearing_id in target_bearings
+            }
+        required_bearings = {
+            bearing_id
+            for bearing_ids in self.class_groups.values()
+            for bearing_id in bearing_ids
+        }
+        missing_target = sorted(required_bearings.difference(target_bearings))
+        if missing_target:
+            raise ValueError(
+                f'Target condition {self.target_condition} is missing bearings: '
+                f'{missing_target}'
+            )
+
+        self.target_classes = list(self.class_groups)
         self.num_classes = len(self.target_classes)
 
         for cond in self.source_conditions:
             src_dir = os.path.join(self.root_path, cond)
             if not os.path.isdir(src_dir):
                 raise FileNotFoundError(f'Source condition directory not found: {src_dir}')
-            src_classes = self._list_class_dirs(src_dir)
-            if src_classes != self.target_classes:
+            src_bearings = self._list_class_dirs(src_dir)
+            missing_source = sorted(required_bearings.difference(src_bearings))
+            if missing_source:
                 raise ValueError(
-                    f'Class mismatch for source condition {cond}\n'
-                    f'  source: {src_classes}\n'
-                    f'  target: {self.target_classes}'
+                    f'Source condition {cond} is missing bearings: {missing_source}'
                 )
 
         self.source_classes = list(self.target_classes)
@@ -136,19 +184,29 @@ class PUMetaDataset(data.Dataset):
         self.target_test_data = {}
 
         for class_seed, cls_name in enumerate(self.target_classes):
+            bearing_ids = self.class_groups[cls_name]
             merged_source = []
             for cond in self.source_conditions:
-                src_cls_dir = os.path.join(self.root_path, cond, cls_name)
-                cls_data = read_directory(src_cls_dir, self.height, self.width)
-                if len(cls_data) == 0:
-                    raise ValueError(f'No images under source class directory: {src_cls_dir}')
-                merged_source.append(cls_data)
+                for bearing_id in bearing_ids:
+                    src_cls_dir = os.path.join(self.root_path, cond, bearing_id)
+                    cls_data = read_directory(src_cls_dir, self.height, self.width)
+                    if len(cls_data) == 0:
+                        raise ValueError(
+                            f'No images under source bearing directory: {src_cls_dir}'
+                        )
+                    merged_source.append(cls_data)
             self.source_data[cls_name] = np.concatenate(merged_source, axis=0)
 
-            tgt_cls_dir = os.path.join(target_dir, cls_name)
-            tgt_data = read_directory(tgt_cls_dir, self.height, self.width)
-            if len(tgt_data) == 0:
-                raise ValueError(f'No images under target class directory: {tgt_cls_dir}')
+            target_group = []
+            for bearing_id in bearing_ids:
+                tgt_cls_dir = os.path.join(target_dir, bearing_id)
+                bearing_data = read_directory(tgt_cls_dir, self.height, self.width)
+                if len(bearing_data) == 0:
+                    raise ValueError(
+                        f'No images under target bearing directory: {tgt_cls_dir}'
+                    )
+                target_group.append(bearing_data)
+            tgt_data = np.concatenate(target_group, axis=0)
             val_data, test_data = _split_target_class_data(
                 tgt_data,
                 val_ratio=self.target_val_ratio,
@@ -159,7 +217,7 @@ class PUMetaDataset(data.Dataset):
 
         print(
             f'Source conditions {self.source_conditions} -> target {self.target_condition}; '
-            f'classes={self.num_classes}'
+            f'classification={self.classification_name}; classes={self.num_classes}'
         )
 
     def to_maml_dataset_format(self, mode='train'):

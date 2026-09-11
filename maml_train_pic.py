@@ -2,21 +2,167 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
+import random
 import time
+from collections import OrderedDict
+from contextlib import contextmanager
 
 import numpy as np
 import torch
+
+try:
+    from torch.func import functional_call
+except ImportError:
+    from torch.nn.utils.stateless import functional_call
 
 from config_pu import PU_CONFIG, QUICK_TEST
 from l2l_shim import MAML as MAMLAlgo
 from l2l_shim import MetaDataset, TaskDataset
 from maml_model import Net4CNN, Net4LSK
+from classic_config import resolve_method_config
+from classic_models import ClassicMetricModel, MetricAlgorithm
+from transfer_models import TransferModel, TransferAlgorithm, TransferEpisode
 from my_utils.init_utils import seed_torch
 from my_utils.train_utils import accuracy
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+def cap_and_renormalize_weights(weights, max_weight, eps=1e-12):
+    """Cap oversized task weights and redistribute the excess until sum(weights)=1."""
+    weights = weights.clone()
+
+    if weights.ndim != 1 or weights.numel() == 0:
+        raise ValueError('Task weights must be a non-empty 1D tensor.')
+    if max_weight < 1.0 / weights.numel():
+        raise ValueError('max_weight must be >= uniform task weight.')
+    if not torch.isfinite(weights).all() or torch.any(weights < 0):
+        raise ValueError('Task weights must be finite and non-negative.')
+
+    locked = torch.zeros_like(weights, dtype=torch.bool)
+
+    for _ in range(weights.numel()):
+        over = (weights > max_weight) & (~locked)
+        if not torch.any(over):
+            break
+
+        locked |= over
+        weights[over] = max_weight
+
+        free = ~locked
+        remaining = 1.0 - weights[locked].sum()
+        if not torch.any(free):
+            break
+
+        free_sum = weights[free].sum()
+        if free_sum <= eps:
+            weights[free] = remaining / free.sum()
+        else:
+            weights[free] = weights[free] / free_sum * remaining
+
+    weights = weights / weights.sum().clamp_min(eps)
+    return weights
+
+
+def compute_ggm_rw_weights(
+    gaps,
+    epoch,
+    batch_size,
+    temperature=1.0,
+    alpha_max=0.20,
+    warmup_epochs=50,
+    z_clip=2.0,
+    max_ratio=3.0,
+    eps=1e-6,
+):
+    """
+    Convert detached per-task generalization gaps into bounded meta-batch weights.
+
+    A larger positive gap means that support adaptation fits the support set much
+    better than the query set. GGM-RW treats it as a relatively difficult task,
+    applies z-score normalization, clipping and softmax, then mixes the result
+    with uniform weights through a cosine warm-up. Returned weights sum to one,
+    are capped at ``max_ratio / batch_size`` and never create an extra gradient
+    path through the pilot calculation.
+    """
+    if len(gaps) != batch_size or batch_size <= 0:
+        raise ValueError('The number of pilot gaps must equal the meta-batch size.')
+    if temperature <= 0 or alpha_max < 0 or alpha_max > 1:
+        raise ValueError('temperature must be positive and alpha_max must be in [0, 1].')
+    if z_clip < 0 or max_ratio < 1 or eps <= 0:
+        raise ValueError('z_clip, max_ratio, or eps has an invalid value.')
+
+    gaps = torch.stack(gaps).float()
+    if not torch.isfinite(gaps).all():
+        raise ValueError('GGM-RW received a non-finite pilot gap.')
+
+    mean_gap = gaps.mean()
+    std_gap = gaps.std(unbiased=False)
+    z = (gaps - mean_gap) / (std_gap + eps)
+    z = torch.clamp(z, min=-z_clip, max=z_clip)
+    difficulty = torch.softmax(z / temperature, dim=0)
+
+    progress = min(float(epoch + 1) / float(max(warmup_epochs, 1)), 1.0)
+    alpha_t = alpha_max * 0.5 * (1.0 - np.cos(np.pi * progress))
+    weights = (1.0 - alpha_t) / batch_size + alpha_t * difficulty
+    weights = cap_and_renormalize_weights(
+        weights,
+        max_weight=max_ratio / batch_size,
+        eps=eps,
+    )
+
+    return weights.detach(), {
+        'gap_mean': mean_gap.item(),
+        'gap_std': std_gap.item(),
+        'weight_min': weights.min().item(),
+        'weight_max': weights.max().item(),
+        'alpha': float(alpha_t),
+    }
+
+
+@contextmanager
+def freeze_bn_running_stats(model):
+    """
+    Temporarily use train-mode batch statistics without changing BN running buffers.
+
+    This context is used only by the additional first-order GGM pilot. The formal
+    second-order MAML pass keeps the original remote-branch BatchNorm behavior.
+    """
+    states = []
+    for module in model.modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            states.append((module, module.track_running_stats))
+            module.track_running_stats = False
+
+    try:
+        yield
+    finally:
+        for module, old_state in states:
+            module.track_running_stats = old_state
+
+
+def capture_rng_state():
+    """Snapshot all RNG streams used by task/model computation before the GGM pilot."""
+    state = {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.random.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state['cuda'] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state):
+    """Restore RNG streams so the pilot itself does not alter subsequent randomness."""
+    random.setstate(state['python'])
+    np.random.set_state(state['numpy'])
+    torch.random.set_rng_state(state['torch'])
+    if torch.cuda.is_available() and 'cuda' in state:
+        torch.cuda.set_rng_state_all(state['cuda'])
 
 
 def _artifact_name(path):
@@ -26,8 +172,10 @@ def _artifact_name(path):
     return name or 'STFT_CNN4_MAML'
 
 
-def _visual_dir(cfg):
+def _visual_dir(cfg, artifact_path=None):
     out_dir = cfg.get('visualization_dir', './results')
+    if artifact_path:
+        out_dir = os.path.join(out_dir, _artifact_name(artifact_path))
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
 
@@ -36,7 +184,7 @@ def _save_training_history(history, save_path, cfg):
     if not history or not cfg.get('save_visualizations', True):
         return
 
-    out_dir = _visual_dir(cfg)
+    out_dir = _visual_dir(cfg, save_path)
     name = _artifact_name(save_path)
     csv_path = os.path.join(out_dir, f'{name}_training_history.csv')
     curve_path = os.path.join(out_dir, f'{name}_training_curves.png')
@@ -59,7 +207,7 @@ def _save_training_history(history, save_path, cfg):
         axes[0].plot(epochs, [row['valid_loss'] for row in history], label='valid')
         axes[0].set_xlabel('Epoch')
         axes[0].set_ylabel('Loss')
-        axes[0].set_title('MAML Loss')
+        axes[0].set_title(f"{cfg.get('method', 'maml')} Loss")
         axes[0].grid(alpha=0.25)
         axes[0].legend()
 
@@ -68,7 +216,7 @@ def _save_training_history(history, save_path, cfg):
         axes[1].set_xlabel('Epoch')
         axes[1].set_ylabel('Accuracy')
         axes[1].set_ylim(0, 1)
-        axes[1].set_title('MAML Accuracy')
+        axes[1].set_title(f"{cfg.get('method', 'maml')} Accuracy")
         axes[1].grid(alpha=0.25)
         axes[1].legend()
 
@@ -239,7 +387,7 @@ def _save_test_visualizations(
     if not cfg.get('save_visualizations', True):
         return
 
-    out_dir = _visual_dir(cfg)
+    out_dir = _visual_dir(cfg, load_path)
     name = _artifact_name(load_path)
     prediction_csv = _save_prediction_rows(rows, out_dir, name)
     cm_csv, cm_png = _save_confusion_matrix(y_true, y_pred, class_names, out_dir, name)
@@ -258,7 +406,24 @@ def _save_test_visualizations(
 
 class MAML_learner(object):
     def __init__(self, ways, pu_config=None):
-        cfg = pu_config or {}
+        cfg = resolve_method_config(pu_config or PU_CONFIG)
+        self.pu_config = cfg
+        self.method = cfg['method']
+        self.ways = ways
+        self._pu_storage = None
+        if self.method in ('resnet18', 'resnet18_ft', 'tl_wdcnn'):
+            pool = cfg.get('class_groups', cfg.get('class_names', []))
+            if not pool:
+                raise ValueError('Transfer learning requires the source class pool in config')
+            self.model = TransferModel(self.method, len(pool)).to(device)
+            self.backbone_name = cfg['backbone']
+            self.frequency_module = self.denoise_module = self.attention_module = 'none'
+            return
+        if self.method in ('protonet', 'matchingnet', 'relationnet'):
+            self.model = ClassicMetricModel(cfg).to(device)
+            self.backbone_name = 'cnn4'
+            self.frequency_module = self.denoise_module = self.attention_module = 'none'
+            return
         hidden_size = cfg.get('hidden_size', 64)
         layers = 4
         img_size = cfg.get('img_size', 64)
@@ -278,6 +443,9 @@ class MAML_learner(object):
                 gfnet_mlp_ratio=cfg.get('gfnet_mlp_ratio', 2),
                 gfnet_weight_scale=cfg.get('gfnet_weight_scale', 0.02),
                 gfnet_layer_scale_init=cfg.get('gfnet_layer_scale_init', 1e-2),
+                denoise_module=cfg.get('denoise_module', 'none'),
+                arsm_reduction=cfg.get('arsm_reduction', 4),
+                arsm_blend_init=cfg.get('arsm_blend_init', 1e-3),
                 attention_module=cfg.get('attention_module', 'none'),
                 ema_factor=cfg.get('ema_factor', 8),
                 ema_layer_scale_init=cfg.get('ema_layer_scale_init', 1e-3),
@@ -287,10 +455,13 @@ class MAML_learner(object):
                 gcnet_layer_scale_init=cfg.get('gcnet_layer_scale_init', 1e-4),
             ).to(device)
             self.frequency_module = getattr(self.model, 'frequency_module', 'none')
+            self.denoise_module = getattr(self.model, 'denoise_module', 'none')
             self.attention_module = getattr(self.model, 'attention_module', 'none')
             self.backbone_name = 'lsk_lite'
             if self.frequency_module != 'none':
                 self.backbone_name = f'{self.backbone_name}_{self.frequency_module}'
+            if self.denoise_module != 'none':
+                self.backbone_name = f'{self.backbone_name}_{self.denoise_module}'
             if self.attention_module != 'none':
                 self.backbone_name = f'{self.backbone_name}_{self.attention_module}'
         elif backbone == 'cnn4':
@@ -304,15 +475,37 @@ class MAML_learner(object):
             ).to(device)
             self.backbone_name = 'cnn4'
             self.frequency_module = 'none'
+            self.denoise_module = 'none'
             self.attention_module = 'none'
         else:
             raise ValueError(f'Unknown backbone: {backbone}')
 
         self.ways = ways
-        self.pu_config = pu_config or PU_CONFIG
+        self.pu_config = cfg
         self._pu_storage = None
 
+    def _algorithm(self):
+        if self.method in ('resnet18_ft', 'tl_wdcnn'):
+            return TransferAlgorithm(self.model, self.pu_config)
+        if self.method in ('protonet', 'matchingnet', 'relationnet'):
+            return MetricAlgorithm(self.model)
+        return MAMLAlgo(self.model, lr=self.pu_config.get('inner_lr', 0.05))
+
+    def _get_raw_storage(self):
+        if self._pu_storage is None:
+            from raw_signal_dataset import RawSignalDataset
+            self._pu_storage = RawSignalDataset(self.pu_config)
+        return self._pu_storage
+
+    def _raw_tasks(self, mode, ways, shots, queries, num_tasks, filter_labels):
+        storage = self._get_raw_storage().for_mode(mode)
+        return TaskDataset(MetaDataset(storage),
+            n_way=len(filter_labels) if filter_labels is not None else ways,
+            k_shot=shots, q_query=queries, num_tasks=num_tasks, filter_labels=filter_labels)
+
     def _get_pu_storage(self):
+        if self.method == 'tl_wdcnn':
+            return self._get_raw_storage()
         if self._pu_storage is None:
             from pu_dataset import PUMetaDataset
 
@@ -324,11 +517,15 @@ class MAML_learner(object):
                 img_size=cfg.get('img_size', 64),
                 target_val_ratio=cfg.get('target_val_ratio', 0.5),
                 split_seed=cfg.get('seed', 24),
+                class_groups=cfg.get('class_groups'),
+                classification_name=cfg.get('classification_preset'),
             )
         return self._pu_storage
 
     def build_tasks(self, mode='train', ways=5, shots=1, queries=1,
                     num_tasks=100, filter_labels=None):
+        if self.method == 'tl_wdcnn':
+            return self._raw_tasks(mode, ways, shots, queries, num_tasks, filter_labels)
         from pu_dataset import PUMetaDataset
 
         cfg = self.pu_config
@@ -340,6 +537,8 @@ class MAML_learner(object):
             img_size=cfg.get('img_size', 64),
             target_val_ratio=cfg.get('target_val_ratio', 0.5),
             split_seed=cfg.get('seed', 24),
+            class_groups=cfg.get('class_groups'),
+            classification_name=cfg.get('classification_preset'),
             share_storage=storage,
         )
         ds.set_mode(mode)
@@ -409,7 +608,7 @@ class MAML_learner(object):
         support_x, support_y, query_x, query_y, used_classes = fixed_task
         task = (support_x, support_y, query_x, query_y)
         cfg = self.pu_config
-        maml = MAMLAlgo(self.model, lr=cfg.get('inner_lr', 0.05))
+        maml = self._algorithm()
         loss = torch.nn.CrossEntropyLoss(reduction='mean')
         learner = maml.clone()
         _, fixed_acc, features, labels, _ = self.fast_adapt(
@@ -437,23 +636,117 @@ class MAML_learner(object):
         query_data = query_data.to(device)
         query_labels = query_labels.to(device)
 
-        for _ in range(adaptation_steps):
-            train_error = loss(learner(support_data)[1], support_labels)
-            learner.adapt(train_error)
-
-        features, predictions = learner(query_data)
-        valid_error = loss(predictions, query_labels)
+        if isinstance(learner, TransferEpisode):
+            features, predictions = learner.evaluate_episode(support_data, support_labels, query_data)
+            valid_error = loss(predictions, query_labels)
+        elif isinstance(learner, ClassicMetricModel):
+            features, predictions = learner.episode(support_data, support_labels, query_data)
+            valid_error = learner.episode_loss(predictions, query_labels)
+        else:
+            for _ in range(adaptation_steps):
+                train_error = loss(learner(support_data)[1], support_labels)
+                learner.adapt(train_error)
+            features, predictions = learner(query_data)
+            valid_error = loss(predictions, query_labels)
         valid_accuracy = accuracy(predictions, query_labels)
         if return_predictions:
             return valid_error, valid_accuracy, features, query_labels, predictions
         return valid_error, valid_accuracy, features, query_labels
 
+    def evaluate_meta_tasks(
+        self,
+        tasks,
+        maml,
+        loss,
+        adaptation_steps,
+        num_episodes,
+    ):
+        """Evaluate fresh episodes without updating the shared meta-model."""
+        if num_episodes <= 0:
+            raise ValueError('num_episodes must be positive.')
+
+        total_error = 0.0
+        total_accuracy = 0.0
+        for _ in range(num_episodes):
+            learner = maml.clone()
+            task = tasks.sample()
+            evaluation_error, evaluation_accuracy, _, _ = self.fast_adapt(
+                task,
+                learner,
+                loss,
+                adaptation_steps,
+            )
+            total_error += evaluation_error.item()
+            total_accuracy += evaluation_accuracy.item()
+
+        return (
+            total_error / num_episodes,
+            total_accuracy / num_episodes,
+        )
+
+    @staticmethod
+    def pilot_generalization_gap(task, model, loss, adaptation_steps, inner_lr):
+        """
+        Estimate ``max(0, query_loss - post_adaptation_support_loss)`` for one task.
+
+        The pilot clones detached parameters and uses first-order inner updates,
+        so it is cheaper than the formal second-order MAML pass and cannot update
+        the base model. Its output is used only as a detached weighting signal.
+        """
+        support_data, support_labels, query_data, query_labels = task
+        support_data = support_data.to(device)
+        support_labels = support_labels.to(device)
+        query_data = query_data.to(device)
+        query_labels = query_labels.to(device)
+
+        fast_params = OrderedDict(
+            (name, param.detach().clone().requires_grad_(True))
+            for name, param in model.named_parameters()
+        )
+
+        for _ in range(adaptation_steps):
+            _, support_logits = functional_call(model, fast_params, (support_data,))
+            support_loss = loss(support_logits, support_labels)
+            grads = torch.autograd.grad(
+                support_loss,
+                tuple(fast_params.values()),
+                create_graph=False,
+                retain_graph=False,
+            )
+            fast_params = OrderedDict(
+                (
+                    name,
+                    (param - inner_lr * grad).detach().requires_grad_(True),
+                )
+                for (name, param), grad in zip(fast_params.items(), grads)
+            )
+
+        _, support_logits_post = functional_call(
+            model,
+            fast_params,
+            (support_data,),
+        )
+        support_loss_post = loss(support_logits_post, support_labels)
+        _, query_logits = functional_call(model, fast_params, (query_data,))
+        query_loss = loss(query_logits, query_labels)
+        return torch.relu(query_loss - support_loss_post).detach()
+
     def train(self, save_path, shots=1, quick_test=False):
+        if self.method == 'resnet18':
+            from supervised_training import train_supervised
+            return train_supervised(self, save_path, quick_test)
+        if self.method in ('resnet18_ft', 'tl_wdcnn'):
+            from transfer_training import train_transfer
+            return train_transfer(self, save_path, shots, quick_test)
         cfg = self.pu_config
+        os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+        with open(save_path + '_best.config.json', 'w', encoding='utf-8') as stream:
+            json.dump(dict(cfg, actual_shots=shots, quick_test=quick_test), stream,
+                      ensure_ascii=False, indent=2, default=str)
         meta_lr = cfg.get('outer_lr', 0.005)
         fast_lr = cfg.get('inner_lr', 0.05)
         queries = cfg.get('q_query', 1)
-        maml = MAMLAlgo(self.model, lr=fast_lr)
+        maml = self._algorithm()
         opt = torch.optim.Adam(maml.parameters(), meta_lr)
         loss = torch.nn.CrossEntropyLoss(reduction='mean')
 
@@ -462,10 +755,56 @@ class MAML_learner(object):
         epochs = 3 if quick_test else cfg.get('epochs', 250)
         meta_batch_size = 4 if quick_test else cfg.get('meta_batch_size', 16)
         adaptation_steps = cfg.get('adaptation_steps', {}).get(shots, 1)
+        weighting_mode = cfg.get('task_weighting_mode', 'none').lower()
+        if weighting_mode not in ('none', 'ggm_rw'):
+            raise ValueError(f'Unknown task_weighting_mode: {weighting_mode}')
+        early_stop_enabled = (
+            bool(cfg.get('early_stop_on_perfect_validation', False))
+            and not quick_test
+        )
+        early_stop_trigger = float(cfg.get('early_stop_trigger_accuracy', 1.0))
+        early_stop_confirmation_episodes = int(
+            cfg.get('early_stop_confirmation_episodes', 100)
+        )
+        early_stop_confirmation_accuracy = float(
+            cfg.get('early_stop_confirmation_accuracy', 0.99)
+        )
+        if not 0.0 <= early_stop_trigger <= 1.0:
+            raise ValueError('early_stop_trigger_accuracy must be in [0, 1].')
+        if early_stop_confirmation_episodes <= 0:
+            raise ValueError('early_stop_confirmation_episodes must be positive.')
+        if not 0.0 <= early_stop_confirmation_accuracy <= 1.0:
+            raise ValueError('early_stop_confirmation_accuracy must be in [0, 1].')
+        grad_clip_norm = cfg.get('outer_grad_clip_norm')
+        scheduler_name = str(cfg.get('outer_lr_scheduler', 'none')).lower()
+        if scheduler_name in ('none', 'off', 'false'):
+            scheduler = None
+        elif scheduler_name == 'cosine':
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt,
+                T_max=max(epochs, 1),
+                eta_min=cfg.get('outer_lr_min', 0.0),
+            )
+        else:
+            raise ValueError(f'Unknown outer_lr_scheduler: {scheduler_name}')
+
+        if early_stop_enabled:
+            early_stop_summary = (
+                f'trigger>={early_stop_trigger:.4f}, '
+                f'confirm={early_stop_confirmation_episodes}eps'
+                f'>={early_stop_confirmation_accuracy:.4f}'
+            )
+        elif quick_test and cfg.get('early_stop_on_perfect_validation', False):
+            early_stop_summary = 'off(quick-test)'
+        else:
+            early_stop_summary = 'off'
 
         print(
-            f'Train STFT-{self.backbone_name}-MAML: {train_ways}-way {shots}-shot '
-            f'{queries}-query, epochs={epochs}, meta_batch={meta_batch_size}'
+            f'Train {self.method} STFT-{self.backbone_name}: {train_ways}-way {shots}-shot '
+            f'{queries}-query, epochs={epochs}, meta_batch={meta_batch_size}, '
+            f'outer_lr={meta_lr}, scheduler={scheduler_name}, '
+            f'grad_clip={grad_clip_norm}, task_weighting={weighting_mode}, '
+            f'early_stop={early_stop_summary}'
         )
 
         train_tasks = self.build_tasks('train', train_ways, shots, queries, num_tasks)
@@ -478,22 +817,66 @@ class MAML_learner(object):
 
         for ep in range(epochs):
             t0 = time.time()
+            current_lr = opt.param_groups[0]['lr']
             meta_train_error = 0.0
             meta_train_accuracy = 0.0
             meta_valid_error = 0.0
             meta_valid_accuracy = 0.0
 
             opt.zero_grad()
-            for _ in range(meta_batch_size):
+            train_batch = [
+                train_tasks.sample()
+                for _ in range(meta_batch_size)
+            ]
+
+            # GGM-RW first evaluates exactly the same task batch with an isolated,
+            # first-order pilot. RNG restoration prevents this extra pass from
+            # changing stochastic behavior in the formal second-order pass.
+            if weighting_mode == 'ggm_rw':
+                rng_state = capture_rng_state()
+                pilot_gaps = []
+                try:
+                    with freeze_bn_running_stats(self.model):
+                        for task in train_batch:
+                            pilot_gaps.append(self.pilot_generalization_gap(
+                                task=task,
+                                model=self.model,
+                                loss=loss,
+                                adaptation_steps=adaptation_steps,
+                                inner_lr=fast_lr,
+                            ))
+                finally:
+                    restore_rng_state(rng_state)
+
+                task_weights, ggm_stats = compute_ggm_rw_weights(
+                    gaps=pilot_gaps,
+                    epoch=ep,
+                    batch_size=meta_batch_size,
+                    temperature=cfg.get('task_weight_temperature', 1.0),
+                    alpha_max=cfg.get('task_weight_alpha_max', 0.20),
+                    warmup_epochs=cfg.get('task_weight_warmup_epochs', 50),
+                    z_clip=cfg.get('task_weight_z_clip', 2.0),
+                    max_ratio=cfg.get('task_weight_max_ratio', 3.0),
+                    eps=cfg.get('task_weight_eps', 1e-6),
+                )
+            else:
+                task_weights = None
+                ggm_stats = None
+
+            for task_idx, task in enumerate(train_batch):
                 learner = maml.clone()
-                task = train_tasks.sample()
                 evaluation_error, evaluation_accuracy, _, _ = self.fast_adapt(
                     task, learner, loss, adaptation_steps
                 )
-                evaluation_error.backward()
+                if weighting_mode == 'ggm_rw':
+                    weighted_error = task_weights[task_idx] * evaluation_error
+                    weighted_error.backward()
+                else:
+                    evaluation_error.backward()
                 meta_train_error += evaluation_error.item()
                 meta_train_accuracy += evaluation_accuracy.item()
 
+            for _ in range(meta_batch_size):
                 learner = maml.clone()
                 task = valid_tasks.sample()
                 evaluation_error, evaluation_accuracy, _, _ = self.fast_adapt(
@@ -502,10 +885,38 @@ class MAML_learner(object):
                 meta_valid_error += evaluation_error.item()
                 meta_valid_accuracy += evaluation_accuracy.item()
 
-            for p in maml.parameters():
-                if p.grad is not None:
-                    p.grad.data.mul_(1.0 / meta_batch_size)
-            opt.step()
+            # Standard MAML accumulates B unscaled task losses and divides the
+            # resulting gradients by B. GGM weights already sum to one, so an
+            # additional division would make its effective learning rate B times smaller.
+            if weighting_mode == 'none':
+                for p in maml.parameters():
+                    if p.grad is not None:
+                        p.grad.data.mul_(1.0 / meta_batch_size)
+
+            # Clip the fully aggregated outer gradient for both none and GGM-RW.
+            if grad_clip_norm is not None and float(grad_clip_norm) > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    maml.parameters(),
+                    max_norm=float(grad_clip_norm),
+                    error_if_nonfinite=False,
+                )
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    maml.parameters(),
+                    max_norm=float('inf'),
+                    error_if_nonfinite=False,
+                )
+
+            grad_norm_value = float(grad_norm.detach().cpu())
+            if np.isfinite(grad_norm_value):
+                opt.step()
+            else:
+                print(
+                    f'[warn] Epoch {ep + 1}: non-finite outer gradient; '
+                    'optimizer step skipped.'
+                )
+            if scheduler is not None:
+                scheduler.step()
 
             avg_train_acc = meta_train_accuracy / meta_batch_size
             avg_valid_acc = meta_valid_accuracy / meta_batch_size
@@ -513,36 +924,123 @@ class MAML_learner(object):
             avg_valid_err = meta_valid_error / meta_batch_size
             epoch_seconds = time.time() - t0
 
-            history.append({
+            history_row = {
                 'epoch': ep + 1,
                 'train_loss': avg_train_err,
                 'train_acc': avg_train_acc,
                 'valid_loss': avg_valid_err,
                 'valid_acc': avg_valid_acc,
                 'epoch_seconds': epoch_seconds,
+                'outer_lr': current_lr,
+                'outer_grad_norm': grad_norm_value,
                 'best_valid_acc': max(best_valid_acc, avg_valid_acc),
                 'best_epoch': ep + 1 if avg_valid_acc > best_valid_acc else best_epoch,
-            })
+                'early_stop_triggered': False,
+                'early_stop_confirmation_episodes': 0,
+                'early_stop_confirmation_loss': '',
+                'early_stop_confirmation_acc': '',
+                'early_stop_confirmed': False,
+            }
+            if ggm_stats is not None:
+                history_row.update({
+                    'ggm_gap_mean': ggm_stats['gap_mean'],
+                    'ggm_gap_std': ggm_stats['gap_std'],
+                    'ggm_weight_min': ggm_stats['weight_min'],
+                    'ggm_weight_max': ggm_stats['weight_max'],
+                    'ggm_alpha': ggm_stats['alpha'],
+                })
+            history.append(history_row)
 
-            print(
+            epoch_message = (
                 f'Epoch {ep + 1:03d} | '
                 f'time={epoch_seconds:.2f}s | '
                 f'train_loss={avg_train_err:.4f} acc={avg_train_acc:.4f} | '
                 f'valid_loss={avg_valid_err:.4f} acc={avg_valid_acc:.4f} | '
+                f'lr={current_lr:.6f} grad={grad_norm_value:.3f} | '
                 f'best={best_valid_acc:.4f}@{best_epoch}'
             )
+            if ggm_stats is not None:
+                epoch_message += (
+                    f' | gap={ggm_stats["gap_mean"]:.4f}±{ggm_stats["gap_std"]:.4f} '
+                    f'w=[{ggm_stats["weight_min"]:.4f},{ggm_stats["weight_max"]:.4f}] '
+                    f'alpha={ggm_stats["alpha"]:.4f}'
+                )
+            print(epoch_message)
 
             if avg_valid_acc > best_valid_acc:
                 best_valid_acc = avg_valid_acc
                 best_epoch = ep + 1
-                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
                 torch.save(self.model.state_dict(), best_path)
                 print(f'  saved best model: {best_path}')
+
+            # A single perfect score from the regular, randomly sampled validation
+            # batch is only a trigger. Confirm it on a larger fresh episode bank
+            # before stopping. Restoring RNG keeps a failed confirmation from
+            # changing the episode sequence of subsequent training epochs.
+            if early_stop_enabled and avg_valid_acc >= early_stop_trigger:
+                history_row['early_stop_triggered'] = True
+                confirmation_rng_state = capture_rng_state()
+                try:
+                    confirmation_loss, confirmation_acc = self.evaluate_meta_tasks(
+                        tasks=valid_tasks,
+                        maml=maml,
+                        loss=loss,
+                        adaptation_steps=adaptation_steps,
+                        num_episodes=early_stop_confirmation_episodes,
+                    )
+                finally:
+                    restore_rng_state(confirmation_rng_state)
+
+                early_stop_confirmed = (
+                    confirmation_acc >= early_stop_confirmation_accuracy
+                )
+                history_row.update({
+                    'epoch_seconds': time.time() - t0,
+                    'early_stop_confirmation_episodes': (
+                        early_stop_confirmation_episodes
+                    ),
+                    'early_stop_confirmation_loss': confirmation_loss,
+                    'early_stop_confirmation_acc': confirmation_acc,
+                    'early_stop_confirmed': early_stop_confirmed,
+                })
+                print(
+                    '  perfect-validation confirmation: '
+                    f'loss={confirmation_loss:.4f} acc={confirmation_acc:.4f} '
+                    f'over {early_stop_confirmation_episodes} episodes '
+                    f'(required>={early_stop_confirmation_accuracy:.4f})'
+                )
+
+                if early_stop_confirmed:
+                    # Save the exact model that passed confirmation even when an
+                    # earlier epoch had already reached the same trigger score.
+                    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+                    torch.save(self.model.state_dict(), best_path)
+                    best_valid_acc = max(best_valid_acc, avg_valid_acc)
+                    best_epoch = ep + 1
+                    history_row['best_valid_acc'] = best_valid_acc
+                    history_row['best_epoch'] = best_epoch
+                    print(
+                        f'  early stopping confirmed at epoch {ep + 1}; '
+                        f'saved model: {best_path}'
+                    )
+                    break
+
+                print('  confirmation below threshold; training continues.')
 
         _save_training_history(history, save_path, cfg)
         return best_path
 
     def test(self, load_path, inner_steps=10, shots=1, meta_batch_size=None):
+        if self.method == 'resnet18':
+            from supervised_training import test_supervised
+            return test_supervised(self, load_path)
+        metadata_path = str(load_path) + '.config.json'
+        if os.path.exists(metadata_path):
+            with open(metadata_path, encoding='utf-8') as stream:
+                saved = json.load(stream)
+            if saved.get('method', 'configured_maml') != self.method:
+                raise ValueError('Checkpoint method differs from config method')
         try:
             state = torch.load(load_path, map_location=device, weights_only=True)
         except TypeError:
@@ -555,7 +1053,7 @@ class MAML_learner(object):
         fast_lr = cfg.get('inner_lr', 0.05)
         test_tasks = self.build_tasks('test', self.ways, shots, queries, 1000)
         class_names = list(self._get_pu_storage().source_classes)
-        maml = MAMLAlgo(self.model, lr=fast_lr)
+        maml = self._algorithm()
         loss = torch.nn.CrossEntropyLoss(reduction='mean')
 
         meta_batch_size = meta_batch_size or cfg.get('test_meta_batch_size', 100)
@@ -615,8 +1113,9 @@ class MAML_learner(object):
             f'Test {self.ways}-way {shots}-shot {queries}-query | '
             f'tasks={meta_batch_size} | time={time.time() - t0:.2f}s'
         )
-        print(f'Meta Test Error: {meta_test_error / meta_batch_size:.4f}')
-        print(f'Meta Test Accuracy: {meta_test_accuracy / meta_batch_size:.4f}')
+        label = 'FT' if self.method in ('resnet18_ft', 'tl_wdcnn') else 'Meta'
+        print(f'{label} Test Error: {meta_test_error / meta_batch_size:.4f}')
+        print(f'{label} Test Accuracy: {meta_test_accuracy / meta_batch_size:.4f}')
 
         if all_features:
             tsne_payload = self.fixed_selected_class_tsne_payload(
@@ -643,16 +1142,28 @@ def main():
     default_model_name = PU_CONFIG.get('model_name', 'STFT_CNN4_MAML')
     parser.add_argument('--model_path', default=os.path.join('.', 'model_save', default_model_name))
     args = parser.parse_args()
+    if not args.train and not args.test:
+        mode = PU_CONFIG.get('run_mode', 'train_test')
+        args.train = mode in ('train', 'train_test')
+        args.test = mode in ('test', 'train_test')
+    print(f"Method: {PU_CONFIG.get('method', 'configured_maml')}")
 
     seed_torch(PU_CONFIG.get('seed', 24))
     print(f'Device: {device}')
-    print(
-        f'Input shape: [batch, {PU_CONFIG["in_channels"]}, '
-        f'{PU_CONFIG["img_size"]}, {PU_CONFIG["img_size"]}]'
-    )
+    if PU_CONFIG.get('method') == 'tl_wdcnn':
+        print(f"Input shape: [batch, 1, {PU_CONFIG['window_size']}] (raw vibration)")
+    else:
+        print(f"Input shape: [batch, {PU_CONFIG['in_channels']}, "
+              f"{PU_CONFIG['img_size']}, {PU_CONFIG['img_size']}] (STFT)")
     print(f'Backbone: {PU_CONFIG.get("backbone", "cnn4")}')
     print(f'Frequency module: {PU_CONFIG.get("frequency_module", "none")}')
+    print(f'Denoise module: {PU_CONFIG.get("denoise_module", "none")}')
     print(f'Attention module: {PU_CONFIG.get("attention_module", "none")}')
+    print(f'Task weighting: {PU_CONFIG.get("task_weighting_mode", "none")}')
+    print(
+        f'Classification preset: {PU_CONFIG.get("classification_preset")} | '
+        f'pool={len(PU_CONFIG.get("class_groups", {}))} classes'
+    )
 
     net = MAML_learner(ways=PU_CONFIG['n_way'], pu_config=PU_CONFIG)
     shots = PU_CONFIG['k_shot']

@@ -24,3 +24,11 @@ results/
 *.tmp
 Thumbs.db
 .DS_Store
+
+# Local CWRU generated data and temporary experiment artifacts
+cwru_data_processed/
+cwru_data_gao2025_stft/
+logs/
+tmp/
+.env
+.env.*

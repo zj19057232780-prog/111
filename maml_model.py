@@ -282,6 +282,45 @@ class GFNetLiteBlock(nn.Module):
         return x + self.layer_scale.view(1, -1, 1, 1) * y
 
 
+class AdaptiveResidualShrinkage(nn.Module):
+    """
+    Channel-wise adaptive soft-threshold denoising with identity-safe blending.
+
+    The threshold follows residual shrinkage networks used in noisy bearing
+    diagnosis. A small learnable blend keeps the initial mapping close to the
+    existing backbone, which is important for stable second-order MAML updates.
+    """
+
+    def __init__(self, channels, reduction=4, blend_init=1e-3):
+        super().__init__()
+        hidden = max(channels // int(reduction), 4)
+        blend_init = float(blend_init)
+        if not 0.0 < blend_init < 1.0:
+            raise ValueError(f'arsm blend_init must be in (0, 1), got {blend_init}')
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.threshold_net = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, channels, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+        blend_logit = torch.logit(torch.full((channels,), blend_init))
+        self.blend_logit = torch.nn.Parameter(blend_logit)
+
+        for module in self.threshold_net.modules():
+            if isinstance(module, nn.Conv2d):
+                maml_init_(module)
+
+    def forward(self, x):
+        magnitude = x.abs()
+        channel_scale = self.pool(magnitude)
+        threshold = self.threshold_net(channel_scale) * channel_scale
+        shrunk = torch.sign(x) * F.relu(magnitude - threshold)
+        blend = torch.sigmoid(self.blend_logit).view(1, -1, 1, 1)
+        return x + blend * (shrunk - x)
+
+
 def _valid_group_factor(channels, factor):
     factor = int(factor)
     factor = max(1, min(factor, channels))
@@ -471,6 +510,9 @@ class LSKLiteBackbone(nn.Module):
         gfnet_mlp_ratio=2,
         gfnet_weight_scale=0.02,
         gfnet_layer_scale_init=1e-2,
+        denoise_module='none',
+        arsm_reduction=4,
+        arsm_blend_init=1e-3,
         attention_module='none',
         ema_factor=8,
         ema_layer_scale_init=1e-3,
@@ -481,6 +523,7 @@ class LSKLiteBackbone(nn.Module):
     ):
         super().__init__()
         frequency_module = (frequency_module or 'none').lower()
+        denoise_module = (denoise_module or 'none').lower()
         attention_module = (attention_module or 'none').lower()
         self.stem = ConvBNAct(channels, stage_channels[0], kernel_size=3, stride=2)
 
@@ -512,6 +555,19 @@ class LSKLiteBackbone(nn.Module):
         else:
             raise ValueError(f'Unknown frequency_module: {frequency_module}')
 
+        if denoise_module in ('none', 'identity', 'off', 'false'):
+            self.denoise = nn.Identity()
+            self.denoise_module = 'none'
+        elif denoise_module in ('arsm', 'adaptive_residual_shrinkage', 'shrinkage'):
+            self.denoise = AdaptiveResidualShrinkage(
+                stage_channels[-1],
+                reduction=arsm_reduction,
+                blend_init=arsm_blend_init,
+            )
+            self.denoise_module = 'arsm'
+        else:
+            raise ValueError(f'Unknown denoise_module: {denoise_module}')
+
         if attention_module in ('none', 'identity', 'off', 'false'):
             self.attention = nn.Identity()
             self.attention_module = 'none'
@@ -540,6 +596,7 @@ class LSKLiteBackbone(nn.Module):
         x = self.stem(x)
         x = self.stages(x)
         x = self.freq_enhance(x)
+        x = self.denoise(x)
         x = self.attention(x)
         x = self.pool(x).flatten(1)
         return x
@@ -575,6 +632,9 @@ class Net4LSK(torch.nn.Module):
         gfnet_mlp_ratio=2,
         gfnet_weight_scale=0.02,
         gfnet_layer_scale_init=1e-2,
+        denoise_module='none',
+        arsm_reduction=4,
+        arsm_blend_init=1e-3,
         attention_module='none',
         ema_factor=8,
         ema_layer_scale_init=1e-3,
@@ -595,6 +655,9 @@ class Net4LSK(torch.nn.Module):
             gfnet_mlp_ratio=gfnet_mlp_ratio,
             gfnet_weight_scale=gfnet_weight_scale,
             gfnet_layer_scale_init=gfnet_layer_scale_init,
+            denoise_module=denoise_module,
+            arsm_reduction=arsm_reduction,
+            arsm_blend_init=arsm_blend_init,
             attention_module=attention_module,
             ema_factor=ema_factor,
             ema_layer_scale_init=ema_layer_scale_init,
@@ -607,6 +670,7 @@ class Net4LSK(torch.nn.Module):
         maml_init_(self.classifier)
         self.embedding_size = self.features.embedding_size
         self.frequency_module = self.features.frequency_module
+        self.denoise_module = self.features.denoise_module
         self.attention_module = self.features.attention_module
 
     def forward(self, x):
