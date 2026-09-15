@@ -27,6 +27,9 @@ Thumbs.db
 
 # Local CWRU generated data and temporary experiment artifacts
 cwru_data_processed/
+hust_data_processed/
+cross_data_processed/
+HUST bearing a practical dataset for ball bearing fault diagnosis/
 cwru_data_gao2025_stft/
 logs/
 tmp/
