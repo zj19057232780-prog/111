@@ -24,3 +24,27 @@ results/
 *.tmp
 Thumbs.db
 .DS_Store
+
+# Local data, experiment output and private workspace metadata
+node_modules/
+.agents/
+.codex/
+.workbuddy/
+.env
+.env.*
+*.pem
+*.key
+CWRU/
+*_data_processed*/
+cross_data_processed*/
+cwru_data_gao2025_stft/
+HUST bearing a practical dataset for ball bearing fault diagnosis/
+table_row_results/
+logs/
+tmp/
+/outputs/
+/archive/
+comparison_models/*/runs/
+*.ckpt
+/project_context.md
+/项目文档.md

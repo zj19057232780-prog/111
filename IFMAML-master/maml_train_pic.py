@@ -1,0 +1,1210 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import random
+import time
+from collections import OrderedDict
+from contextlib import contextmanager
+
+import numpy as np
+import torch
+
+try:
+    from torch.func import functional_call
+except ImportError:
+    from torch.nn.utils.stateless import functional_call
+
+from config_pu import PU_CONFIG, QUICK_TEST
+from l2l_shim import MAML as MAMLAlgo
+from l2l_shim import MetaDataset, TaskDataset
+from maml_model import Net4CNN, Net4LSK
+from classic_config import resolve_method_config
+from classic_models import ClassicMetricModel, MetricAlgorithm
+from transfer_models import TransferModel, TransferAlgorithm, TransferEpisode
+from my_utils.init_utils import seed_torch
+from my_utils.train_utils import accuracy
+
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+def cap_and_renormalize_weights(weights, max_weight, eps=1e-12):
+    """Cap oversized task weights and redistribute the excess until sum(weights)=1."""
+    weights = weights.clone()
+
+    if weights.ndim != 1 or weights.numel() == 0:
+        raise ValueError('Task weights must be a non-empty 1D tensor.')
+    if max_weight < 1.0 / weights.numel():
+        raise ValueError('max_weight must be >= uniform task weight.')
+    if not torch.isfinite(weights).all() or torch.any(weights < 0):
+        raise ValueError('Task weights must be finite and non-negative.')
+
+    locked = torch.zeros_like(weights, dtype=torch.bool)
+
+    for _ in range(weights.numel()):
+        over = (weights > max_weight) & (~locked)
+        if not torch.any(over):
+            break
+
+        locked |= over
+        weights[over] = max_weight
+
+        free = ~locked
+        remaining = 1.0 - weights[locked].sum()
+        if not torch.any(free):
+            break
+
+        free_sum = weights[free].sum()
+        if free_sum <= eps:
+            weights[free] = remaining / free.sum()
+        else:
+            weights[free] = weights[free] / free_sum * remaining
+
+    weights = weights / weights.sum().clamp_min(eps)
+    return weights
+
+
+def compute_ggm_rw_weights(
+    gaps,
+    epoch,
+    batch_size,
+    temperature=1.0,
+    alpha_max=0.20,
+    warmup_epochs=50,
+    z_clip=2.0,
+    max_ratio=3.0,
+    eps=1e-6,
+):
+    """
+    Convert detached per-task generalization gaps into bounded meta-batch weights.
+
+    A larger positive gap means that support adaptation fits the support set much
+    better than the query set. GGM-RW treats it as a relatively difficult task,
+    applies z-score normalization, clipping and softmax, then mixes the result
+    with uniform weights through a cosine warm-up. Returned weights sum to one,
+    are capped at ``max_ratio / batch_size`` and never create an extra gradient
+    path through the pilot calculation.
+    """
+    if len(gaps) != batch_size or batch_size <= 0:
+        raise ValueError('The number of pilot gaps must equal the meta-batch size.')
+    if temperature <= 0 or alpha_max < 0 or alpha_max > 1:
+        raise ValueError('temperature must be positive and alpha_max must be in [0, 1].')
+    if z_clip < 0 or max_ratio < 1 or eps <= 0:
+        raise ValueError('z_clip, max_ratio, or eps has an invalid value.')
+
+    gaps = torch.stack(gaps).float()
+    if not torch.isfinite(gaps).all():
+        raise ValueError('GGM-RW received a non-finite pilot gap.')
+
+    mean_gap = gaps.mean()
+    std_gap = gaps.std(unbiased=False)
+    z = (gaps - mean_gap) / (std_gap + eps)
+    z = torch.clamp(z, min=-z_clip, max=z_clip)
+    difficulty = torch.softmax(z / temperature, dim=0)
+
+    progress = min(float(epoch + 1) / float(max(warmup_epochs, 1)), 1.0)
+    alpha_t = alpha_max * 0.5 * (1.0 - np.cos(np.pi * progress))
+    weights = (1.0 - alpha_t) / batch_size + alpha_t * difficulty
+    weights = cap_and_renormalize_weights(
+        weights,
+        max_weight=max_ratio / batch_size,
+        eps=eps,
+    )
+
+    return weights.detach(), {
+        'gap_mean': mean_gap.item(),
+        'gap_std': std_gap.item(),
+        'weight_min': weights.min().item(),
+        'weight_max': weights.max().item(),
+        'alpha': float(alpha_t),
+    }
+
+
+@contextmanager
+def freeze_bn_running_stats(model):
+    """
+    Temporarily use train-mode batch statistics without changing BN running buffers.
+
+    This context is used only by the additional first-order GGM pilot. The formal
+    second-order MAML pass keeps the original remote-branch BatchNorm behavior.
+    """
+    states = []
+    for module in model.modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            states.append((module, module.track_running_stats))
+            module.track_running_stats = False
+
+    try:
+        yield
+    finally:
+        for module, old_state in states:
+            module.track_running_stats = old_state
+
+
+def capture_rng_state():
+    """Snapshot all RNG streams used by task/model computation before the GGM pilot."""
+    state = {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.random.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state['cuda'] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state):
+    """Restore RNG streams so the pilot itself does not alter subsequent randomness."""
+    random.setstate(state['python'])
+    np.random.set_state(state['numpy'])
+    torch.random.set_rng_state(state['torch'])
+    if torch.cuda.is_available() and 'cuda' in state:
+        torch.cuda.set_rng_state_all(state['cuda'])
+
+
+def _artifact_name(path):
+    name = os.path.basename(os.path.normpath(path))
+    if name.endswith('_best'):
+        name = name[:-5]
+    return name or 'STFT_CNN4_MAML'
+
+
+def _visual_dir(cfg, artifact_path=None):
+    out_dir = cfg.get('visualization_dir', './results')
+    if artifact_path:
+        out_dir = os.path.join(out_dir, _artifact_name(artifact_path))
+    os.makedirs(out_dir, exist_ok=True)
+    return out_dir
+
+
+def _save_training_history(history, save_path, cfg):
+    if not history or not cfg.get('save_visualizations', True):
+        return
+
+    out_dir = _visual_dir(cfg, save_path)
+    name = _artifact_name(save_path)
+    csv_path = os.path.join(out_dir, f'{name}_training_history.csv')
+    curve_path = os.path.join(out_dir, f'{name}_training_curves.png')
+
+    with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.DictWriter(f, fieldnames=list(history[0].keys()))
+        writer.writeheader()
+        writer.writerows(history)
+
+    try:
+        import matplotlib
+
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        epochs = [row['epoch'] for row in history]
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4), dpi=160)
+
+        axes[0].plot(epochs, [row['train_loss'] for row in history], label='train')
+        axes[0].plot(epochs, [row['valid_loss'] for row in history], label='valid')
+        axes[0].set_xlabel('Epoch')
+        axes[0].set_ylabel('Loss')
+        axes[0].set_title(f"{cfg.get('method', 'maml')} Loss")
+        axes[0].grid(alpha=0.25)
+        axes[0].legend()
+
+        axes[1].plot(epochs, [row['train_acc'] for row in history], label='train')
+        axes[1].plot(epochs, [row['valid_acc'] for row in history], label='valid')
+        axes[1].set_xlabel('Epoch')
+        axes[1].set_ylabel('Accuracy')
+        axes[1].set_ylim(0, 1)
+        axes[1].set_title(f"{cfg.get('method', 'maml')} Accuracy")
+        axes[1].grid(alpha=0.25)
+        axes[1].legend()
+
+        fig.tight_layout()
+        fig.savefig(curve_path)
+        plt.close(fig)
+        print(f'Saved training history: {csv_path}')
+        print(f'Saved training curves: {curve_path}')
+    except Exception as exc:
+        print(f'[warn] Failed to save training curve PNG: {exc}')
+        print(f'Saved training history: {csv_path}')
+
+
+def _save_prediction_rows(rows, out_dir, name):
+    csv_path = os.path.join(out_dir, f'{name}_test_predictions.csv')
+    if not rows:
+        return csv_path
+    with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    return csv_path
+
+
+def _save_confusion_matrix(y_true, y_pred, class_names, out_dir, name):
+    n_classes = len(class_names)
+    cm = np.zeros((n_classes, n_classes), dtype=np.int64)
+    for true_i, pred_i in zip(y_true, y_pred):
+        if 0 <= true_i < n_classes and 0 <= pred_i < n_classes:
+            cm[true_i, pred_i] += 1
+
+    csv_path = os.path.join(out_dir, f'{name}_confusion_matrix_counts.csv')
+    with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
+        writer.writerow(['true\\pred'] + class_names)
+        for idx, row in enumerate(cm):
+            writer.writerow([class_names[idx]] + row.tolist())
+
+    png_path = os.path.join(out_dir, f'{name}_confusion_matrix.png')
+    try:
+        import matplotlib
+
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        row_sum = cm.sum(axis=1, keepdims=True)
+        cm_norm = np.divide(cm, np.maximum(row_sum, 1), where=row_sum != 0)
+
+        fig, ax = plt.subplots(figsize=(11, 9), dpi=180)
+        im = ax.imshow(cm_norm, cmap='Blues', vmin=0, vmax=1)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Recall-normalized count')
+        ax.set_title('Meta-test Confusion Matrix')
+        ax.set_xlabel('Predicted fault class')
+        ax.set_ylabel('True fault class')
+        ax.set_xticks(np.arange(n_classes))
+        ax.set_yticks(np.arange(n_classes))
+        ax.set_xticklabels(class_names, rotation=90, fontsize=6)
+        ax.set_yticklabels(class_names, fontsize=6)
+        fig.tight_layout()
+        fig.savefig(png_path)
+        plt.close(fig)
+    except Exception as exc:
+        print(f'[warn] Failed to save confusion matrix PNG: {exc}')
+
+    return csv_path, png_path
+
+
+def _save_tsne(features, labels, class_names, out_dir, name, cfg):
+    if features.size == 0:
+        return None
+
+    selected_classes = cfg.get('tsne_selected_classes')
+    if selected_classes:
+        class_to_idx = {cls_name: idx for idx, cls_name in enumerate(class_names)}
+        selected_indices = [
+            class_to_idx[cls_name]
+            for cls_name in selected_classes
+            if cls_name in class_to_idx
+        ]
+        missing = [cls_name for cls_name in selected_classes if cls_name not in class_to_idx]
+        if missing:
+            print(f'[warn] t-SNE selected classes not found: {missing}')
+        if not selected_indices:
+            print('[warn] No valid selected classes for t-SNE; skip t-SNE.')
+            return None
+
+        selected_set = set(selected_indices)
+        mask = np.array([label in selected_set for label in labels], dtype=bool)
+        features = features[mask]
+        labels = labels[mask]
+        class_names = [class_names[idx] for idx in selected_indices]
+        remap = {old_idx: new_idx for new_idx, old_idx in enumerate(selected_indices)}
+        labels = np.array([remap[int(label)] for label in labels], dtype=np.int64)
+
+        if features.size == 0:
+            print('[warn] No query features matched selected t-SNE classes.')
+            return None
+
+    max_points = int(cfg.get('tsne_max_points', 1000))
+    if len(features) > max_points:
+        rng = np.random.default_rng(cfg.get('seed', 24))
+        indices = rng.choice(len(features), size=max_points, replace=False)
+        features = features[indices]
+        labels = labels[indices]
+
+    if len(features) < 4:
+        print('[warn] Not enough samples for t-SNE visualization.')
+        return None
+
+    png_path = os.path.join(out_dir, f'{name}_tsne.png')
+    try:
+        import matplotlib
+
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        os.environ.setdefault('LOKY_MAX_CPU_COUNT', str(os.cpu_count() or 1))
+        from sklearn.manifold import TSNE
+
+        perplexity = min(float(cfg.get('tsne_perplexity', 30)), max(2.0, (len(features) - 1) / 3.0))
+        embedding = TSNE(
+            n_components=2,
+            perplexity=perplexity,
+            init='pca',
+            learning_rate='auto',
+            random_state=cfg.get('seed', 24),
+        ).fit_transform(features)
+
+        fig, ax = plt.subplots(figsize=(9, 7), dpi=180)
+        cmap = plt.get_cmap('tab10')
+        for cls_idx, cls_name in enumerate(class_names):
+            mask = labels == cls_idx
+            if not np.any(mask):
+                continue
+            ax.scatter(
+                embedding[mask, 0],
+                embedding[mask, 1],
+                s=12,
+                alpha=0.75,
+                color=cmap(cls_idx % 10),
+                label=cls_name,
+                linewidths=0,
+            )
+        title_suffix = 'Selected Classes' if selected_classes else 'All Classes'
+        ax.set_title(f't-SNE of Meta-test Query Features ({title_suffix})')
+        ax.set_xlabel('t-SNE 1')
+        ax.set_ylabel('t-SNE 2')
+        ax.grid(alpha=0.18)
+        ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.08), ncol=8, fontsize=5, frameon=False)
+        fig.tight_layout()
+        fig.savefig(png_path, bbox_inches='tight')
+        plt.close(fig)
+        return png_path
+    except Exception as exc:
+        print(f'[warn] Failed to save t-SNE PNG: {exc}')
+        return None
+
+
+def _save_test_visualizations(
+    features,
+    y_true,
+    y_pred,
+    rows,
+    class_names,
+    load_path,
+    cfg,
+    tsne_payload=None,
+):
+    if not cfg.get('save_visualizations', True):
+        return
+
+    out_dir = _visual_dir(cfg, load_path)
+    name = _artifact_name(load_path)
+    prediction_csv = _save_prediction_rows(rows, out_dir, name)
+    cm_csv, cm_png = _save_confusion_matrix(y_true, y_pred, class_names, out_dir, name)
+    if tsne_payload is not None:
+        tsne_features, tsne_labels, tsne_class_names = tsne_payload
+        tsne_png = _save_tsne(tsne_features, tsne_labels, tsne_class_names, out_dir, name, cfg)
+    else:
+        tsne_png = _save_tsne(features, y_true, class_names, out_dir, name, cfg)
+
+    print(f'Saved test predictions: {prediction_csv}')
+    print(f'Saved confusion matrix CSV: {cm_csv}')
+    print(f'Saved confusion matrix PNG: {cm_png}')
+    if tsne_png:
+        print(f'Saved t-SNE PNG: {tsne_png}')
+
+
+class MAML_learner(object):
+    def __init__(self, ways, pu_config=None):
+        cfg = resolve_method_config(pu_config or PU_CONFIG)
+        self.pu_config = cfg
+        self.method = cfg['method']
+        self.ways = ways
+        self._pu_storage = None
+        if self.method in ('resnet18', 'resnet18_ft', 'tl_wdcnn'):
+            pool = cfg.get('class_groups', cfg.get('class_names', []))
+            if not pool:
+                raise ValueError('Transfer learning requires the source class pool in config')
+            self.model = TransferModel(self.method, len(pool)).to(device)
+            self.backbone_name = cfg['backbone']
+            self.frequency_module = self.denoise_module = self.attention_module = 'none'
+            return
+        if self.method in ('protonet', 'matchingnet', 'relationnet'):
+            self.model = ClassicMetricModel(cfg).to(device)
+            self.backbone_name = 'cnn4'
+            self.frequency_module = self.denoise_module = self.attention_module = 'none'
+            return
+        hidden_size = cfg.get('hidden_size', 64)
+        layers = 4
+        img_size = cfg.get('img_size', 64)
+        in_channels = cfg.get('in_channels', 1)
+        backbone = cfg.get('backbone', 'cnn4').lower()
+
+        if backbone in ('lsk', 'lsk_lite', 'lsklite'):
+            self.model = Net4LSK(
+                output_size=ways,
+                channels=in_channels,
+                stage_channels=cfg.get('lsk_stage_channels', (32, 64, 96)),
+                stage_depths=cfg.get('lsk_stage_depths', (1, 1, 1)),
+                mlp_ratio=cfg.get('lsk_mlp_ratio', 2),
+                img_size=img_size,
+                frequency_module=cfg.get('frequency_module', 'none'),
+                gfnet_depth=cfg.get('gfnet_depth', 1),
+                gfnet_mlp_ratio=cfg.get('gfnet_mlp_ratio', 2),
+                gfnet_weight_scale=cfg.get('gfnet_weight_scale', 0.02),
+                gfnet_layer_scale_init=cfg.get('gfnet_layer_scale_init', 1e-2),
+                denoise_module=cfg.get('denoise_module', 'none'),
+                arsm_reduction=cfg.get('arsm_reduction', 4),
+                arsm_blend_init=cfg.get('arsm_blend_init', 1e-3),
+                attention_module=cfg.get('attention_module', 'none'),
+                ema_factor=cfg.get('ema_factor', 8),
+                ema_layer_scale_init=cfg.get('ema_layer_scale_init', 1e-3),
+                gcnet_ratio=cfg.get('gcnet_ratio', 0.25),
+                gcnet_pooling_type=cfg.get('gcnet_pooling_type', 'att'),
+                gcnet_fusion_types=cfg.get('gcnet_fusion_types', ('channel_add',)),
+                gcnet_layer_scale_init=cfg.get('gcnet_layer_scale_init', 1e-4),
+            ).to(device)
+            self.frequency_module = getattr(self.model, 'frequency_module', 'none')
+            self.denoise_module = getattr(self.model, 'denoise_module', 'none')
+            self.attention_module = getattr(self.model, 'attention_module', 'none')
+            self.backbone_name = 'lsk_lite'
+            if self.frequency_module != 'none':
+                self.backbone_name = f'{self.backbone_name}_{self.frequency_module}'
+            if self.denoise_module != 'none':
+                self.backbone_name = f'{self.backbone_name}_{self.denoise_module}'
+            if self.attention_module != 'none':
+                self.backbone_name = f'{self.backbone_name}_{self.attention_module}'
+        elif backbone == 'cnn4':
+            feat_size = hidden_size * (img_size // (2 ** layers)) ** 2
+            self.model = Net4CNN(
+                output_size=ways,
+                hidden_size=hidden_size,
+                layers=layers,
+                channels=in_channels,
+                embedding_size=feat_size,
+            ).to(device)
+            self.backbone_name = 'cnn4'
+            self.frequency_module = 'none'
+            self.denoise_module = 'none'
+            self.attention_module = 'none'
+        else:
+            raise ValueError(f'Unknown backbone: {backbone}')
+
+        self.ways = ways
+        self.pu_config = cfg
+        self._pu_storage = None
+
+    def _algorithm(self):
+        if self.method in ('resnet18_ft', 'tl_wdcnn'):
+            return TransferAlgorithm(self.model, self.pu_config)
+        if self.method in ('protonet', 'matchingnet', 'relationnet'):
+            return MetricAlgorithm(self.model)
+        return MAMLAlgo(self.model, lr=self.pu_config.get('inner_lr', 0.05))
+
+    def _get_raw_storage(self):
+        if self._pu_storage is None:
+            from raw_signal_dataset import RawSignalDataset
+            self._pu_storage = RawSignalDataset(self.pu_config)
+        return self._pu_storage
+
+    def _raw_tasks(self, mode, ways, shots, queries, num_tasks, filter_labels):
+        storage = self._get_raw_storage().for_mode(mode)
+        return TaskDataset(MetaDataset(storage),
+            n_way=len(filter_labels) if filter_labels is not None else ways,
+            k_shot=shots, q_query=queries, num_tasks=num_tasks, filter_labels=filter_labels)
+
+    def _get_pu_storage(self):
+        if self.method == 'tl_wdcnn':
+            return self._get_raw_storage()
+        if self._pu_storage is None:
+            from pu_dataset import PUMetaDataset
+
+            cfg = self.pu_config
+            self._pu_storage = PUMetaDataset(
+                root_path=cfg['root_path'],
+                source_condition=cfg['source_condition'],
+                target_condition=cfg['target_condition'],
+                img_size=cfg.get('img_size', 64),
+                target_val_ratio=cfg.get('target_val_ratio', 0.5),
+                split_seed=cfg.get('seed', 24),
+                class_groups=cfg.get('class_groups'),
+                classification_name=cfg.get('classification_preset'),
+            )
+        return self._pu_storage
+
+    def build_tasks(self, mode='train', ways=5, shots=1, queries=1,
+                    num_tasks=100, filter_labels=None):
+        if self.method == 'tl_wdcnn':
+            return self._raw_tasks(mode, ways, shots, queries, num_tasks, filter_labels)
+        from pu_dataset import PUMetaDataset
+
+        cfg = self.pu_config
+        storage = self._get_pu_storage()
+        ds = PUMetaDataset(
+            root_path=cfg['root_path'],
+            source_condition=cfg['source_condition'],
+            target_condition=cfg['target_condition'],
+            img_size=cfg.get('img_size', 64),
+            target_val_ratio=cfg.get('target_val_ratio', 0.5),
+            split_seed=cfg.get('seed', 24),
+            class_groups=cfg.get('class_groups'),
+            classification_name=cfg.get('classification_preset'),
+            share_storage=storage,
+        )
+        ds.set_mode(mode)
+        dataset = MetaDataset(ds)
+        new_ways = len(filter_labels) if filter_labels is not None else ways
+        return TaskDataset(
+            dataset,
+            n_way=new_ways,
+            k_shot=shots,
+            q_query=queries,
+            num_tasks=num_tasks,
+            filter_labels=filter_labels,
+        )
+
+    def build_fixed_selected_class_task(self, shots=1):
+        cfg = self.pu_config
+        selected_classes = cfg.get('tsne_selected_classes')
+        if not selected_classes:
+            return None
+
+        storage = self._get_pu_storage()
+        rng = np.random.default_rng(cfg.get('seed', 24))
+        support_x, support_y = [], []
+        query_x, query_y = [], []
+        used_classes = []
+
+        for cls_name in selected_classes:
+            cls_data = storage.target_test_data.get(cls_name)
+            if cls_data is None:
+                print(f'[warn] fixed t-SNE class not found in target test data: {cls_name}')
+                continue
+            if len(cls_data) <= shots:
+                print(f'[warn] fixed t-SNE class has too few samples: {cls_name}')
+                continue
+
+            new_label = len(used_classes)
+            used_classes.append(cls_name)
+            indices = np.arange(len(cls_data))
+            rng.shuffle(indices)
+            support_indices = indices[:shots]
+            query_indices = indices[shots:]
+
+            for idx in support_indices:
+                support_x.append(torch.from_numpy(np.ascontiguousarray(cls_data[idx])).float())
+                support_y.append(new_label)
+            for idx in query_indices:
+                query_x.append(torch.from_numpy(np.ascontiguousarray(cls_data[idx])).float())
+                query_y.append(new_label)
+
+        if len(used_classes) < 2 or not query_x:
+            print('[warn] fixed selected-class t-SNE task is too small; skip fixed t-SNE.')
+            return None
+
+        return (
+            torch.stack(support_x),
+            torch.tensor(support_y, dtype=torch.long),
+            torch.stack(query_x),
+            torch.tensor(query_y, dtype=torch.long),
+            used_classes,
+        )
+
+    def fixed_selected_class_tsne_payload(self, inner_steps=10, shots=1):
+        fixed_task = self.build_fixed_selected_class_task(shots=shots)
+        if fixed_task is None:
+            return None
+
+        support_x, support_y, query_x, query_y, used_classes = fixed_task
+        task = (support_x, support_y, query_x, query_y)
+        cfg = self.pu_config
+        maml = self._algorithm()
+        loss = torch.nn.CrossEntropyLoss(reduction='mean')
+        learner = maml.clone()
+        _, fixed_acc, features, labels, _ = self.fast_adapt(
+            task,
+            learner,
+            loss,
+            inner_steps,
+            return_predictions=True,
+        )
+        print(
+            f'Fixed selected-class t-SNE task: classes={used_classes}, '
+            f'query_samples={len(query_y)}, acc={fixed_acc.item():.4f}'
+        )
+        return (
+            features.detach().cpu().numpy(),
+            labels.detach().cpu().numpy(),
+            used_classes,
+        )
+
+    @staticmethod
+    def fast_adapt(batch, learner, loss, adaptation_steps, return_predictions=False):
+        support_data, support_labels, query_data, query_labels = batch
+        support_data = support_data.to(device)
+        support_labels = support_labels.to(device)
+        query_data = query_data.to(device)
+        query_labels = query_labels.to(device)
+
+        if isinstance(learner, TransferEpisode):
+            features, predictions = learner.evaluate_episode(support_data, support_labels, query_data)
+            valid_error = loss(predictions, query_labels)
+        elif isinstance(learner, ClassicMetricModel):
+            features, predictions = learner.episode(support_data, support_labels, query_data)
+            valid_error = learner.episode_loss(predictions, query_labels)
+        else:
+            for _ in range(adaptation_steps):
+                train_error = loss(learner(support_data)[1], support_labels)
+                learner.adapt(train_error)
+            features, predictions = learner(query_data)
+            valid_error = loss(predictions, query_labels)
+        valid_accuracy = accuracy(predictions, query_labels)
+        if return_predictions:
+            return valid_error, valid_accuracy, features, query_labels, predictions
+        return valid_error, valid_accuracy, features, query_labels
+
+    def evaluate_meta_tasks(
+        self,
+        tasks,
+        maml,
+        loss,
+        adaptation_steps,
+        num_episodes,
+    ):
+        """Evaluate fresh episodes without updating the shared meta-model."""
+        if num_episodes <= 0:
+            raise ValueError('num_episodes must be positive.')
+
+        total_error = 0.0
+        total_accuracy = 0.0
+        for _ in range(num_episodes):
+            learner = maml.clone()
+            task = tasks.sample()
+            evaluation_error, evaluation_accuracy, _, _ = self.fast_adapt(
+                task,
+                learner,
+                loss,
+                adaptation_steps,
+            )
+            total_error += evaluation_error.item()
+            total_accuracy += evaluation_accuracy.item()
+
+        return (
+            total_error / num_episodes,
+            total_accuracy / num_episodes,
+        )
+
+    @staticmethod
+    def pilot_generalization_gap(task, model, loss, adaptation_steps, inner_lr):
+        """
+        Estimate ``max(0, query_loss - post_adaptation_support_loss)`` for one task.
+
+        The pilot clones detached parameters and uses first-order inner updates,
+        so it is cheaper than the formal second-order MAML pass and cannot update
+        the base model. Its output is used only as a detached weighting signal.
+        """
+        support_data, support_labels, query_data, query_labels = task
+        support_data = support_data.to(device)
+        support_labels = support_labels.to(device)
+        query_data = query_data.to(device)
+        query_labels = query_labels.to(device)
+
+        fast_params = OrderedDict(
+            (name, param.detach().clone().requires_grad_(True))
+            for name, param in model.named_parameters()
+        )
+
+        for _ in range(adaptation_steps):
+            _, support_logits = functional_call(model, fast_params, (support_data,))
+            support_loss = loss(support_logits, support_labels)
+            grads = torch.autograd.grad(
+                support_loss,
+                tuple(fast_params.values()),
+                create_graph=False,
+                retain_graph=False,
+            )
+            fast_params = OrderedDict(
+                (
+                    name,
+                    (param - inner_lr * grad).detach().requires_grad_(True),
+                )
+                for (name, param), grad in zip(fast_params.items(), grads)
+            )
+
+        _, support_logits_post = functional_call(
+            model,
+            fast_params,
+            (support_data,),
+        )
+        support_loss_post = loss(support_logits_post, support_labels)
+        _, query_logits = functional_call(model, fast_params, (query_data,))
+        query_loss = loss(query_logits, query_labels)
+        return torch.relu(query_loss - support_loss_post).detach()
+
+    def train(self, save_path, shots=1, quick_test=False):
+        if self.method == 'resnet18':
+            from supervised_training import train_supervised
+            return train_supervised(self, save_path, quick_test)
+        if self.method in ('resnet18_ft', 'tl_wdcnn'):
+            from transfer_training import train_transfer
+            return train_transfer(self, save_path, shots, quick_test)
+        cfg = self.pu_config
+        os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+        with open(save_path + '_best.config.json', 'w', encoding='utf-8') as stream:
+            json.dump(dict(cfg, actual_shots=shots, quick_test=quick_test), stream,
+                      ensure_ascii=False, indent=2, default=str)
+        meta_lr = cfg.get('outer_lr', 0.005)
+        fast_lr = cfg.get('inner_lr', 0.05)
+        queries = cfg.get('q_query', 1)
+        maml = self._algorithm()
+        opt = torch.optim.Adam(maml.parameters(), meta_lr)
+        loss = torch.nn.CrossEntropyLoss(reduction='mean')
+
+        train_ways = valid_ways = self.ways
+        num_tasks = 20 if quick_test else cfg.get('tasks_per_epoch', 1000)
+        epochs = 3 if quick_test else cfg.get('epochs', 250)
+        meta_batch_size = 4 if quick_test else cfg.get('meta_batch_size', 16)
+        adaptation_steps = cfg.get('adaptation_steps', {}).get(shots, 1)
+        weighting_mode = cfg.get('task_weighting_mode', 'none').lower()
+        if weighting_mode not in ('none', 'ggm_rw'):
+            raise ValueError(f'Unknown task_weighting_mode: {weighting_mode}')
+        early_stop_enabled = (
+            bool(cfg.get('early_stop_on_perfect_validation', False))
+            and not quick_test
+        )
+        early_stop_trigger = float(cfg.get('early_stop_trigger_accuracy', 1.0))
+        patience = int(cfg.get('early_stop_patience', 0))
+        if patience < 0:
+            raise ValueError('early_stop_patience must be non-negative (0 disables it).')
+        if quick_test:
+            patience = 0
+        early_stop_confirmation_episodes = int(
+            cfg.get('early_stop_confirmation_episodes', 100)
+        )
+        early_stop_confirmation_accuracy = float(
+            cfg.get('early_stop_confirmation_accuracy', 0.99)
+        )
+        if not 0.0 <= early_stop_trigger <= 1.0:
+            raise ValueError('early_stop_trigger_accuracy must be in [0, 1].')
+        if early_stop_confirmation_episodes <= 0:
+            raise ValueError('early_stop_confirmation_episodes must be positive.')
+        if not 0.0 <= early_stop_confirmation_accuracy <= 1.0:
+            raise ValueError('early_stop_confirmation_accuracy must be in [0, 1].')
+        grad_clip_norm = cfg.get('outer_grad_clip_norm')
+        scheduler_name = str(cfg.get('outer_lr_scheduler', 'none')).lower()
+        if scheduler_name in ('none', 'off', 'false'):
+            scheduler = None
+        elif scheduler_name == 'cosine':
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt,
+                T_max=max(epochs, 1),
+                eta_min=cfg.get('outer_lr_min', 0.0),
+            )
+        else:
+            raise ValueError(f'Unknown outer_lr_scheduler: {scheduler_name}')
+
+        if early_stop_enabled:
+            early_stop_summary = (
+                f'trigger>={early_stop_trigger:.4f}, '
+                f'confirm={early_stop_confirmation_episodes}eps'
+                f'>={early_stop_confirmation_accuracy:.4f}'
+            )
+        elif quick_test and cfg.get('early_stop_on_perfect_validation', False):
+            early_stop_summary = 'off(quick-test)'
+        else:
+            early_stop_summary = 'off'
+
+        print(
+            f'Train {self.method} {cfg.get("input_representation", "stft")}-{self.backbone_name}: {train_ways}-way {shots}-shot '
+            f'{queries}-query, epochs={epochs}, meta_batch={meta_batch_size}, '
+            f'outer_lr={meta_lr}, scheduler={scheduler_name}, '
+            f'grad_clip={grad_clip_norm}, task_weighting={weighting_mode}, '
+            f'early_stop={early_stop_summary}, no_improvement_patience={patience}'
+        )
+
+        train_tasks = self.build_tasks('train', train_ways, shots, queries, num_tasks)
+        valid_tasks = self.build_tasks('validation', valid_ways, shots, queries, num_tasks)
+
+        best_valid_acc = -1.0
+        best_epoch = 0
+        best_path = save_path + '_best'
+        history = []
+
+        for ep in range(epochs):
+            t0 = time.time()
+            current_lr = opt.param_groups[0]['lr']
+            meta_train_error = 0.0
+            meta_train_accuracy = 0.0
+            meta_valid_error = 0.0
+            meta_valid_accuracy = 0.0
+
+            opt.zero_grad()
+            train_batch = [
+                train_tasks.sample()
+                for _ in range(meta_batch_size)
+            ]
+
+            # GGM-RW first evaluates exactly the same task batch with an isolated,
+            # first-order pilot. RNG restoration prevents this extra pass from
+            # changing stochastic behavior in the formal second-order pass.
+            if weighting_mode == 'ggm_rw':
+                rng_state = capture_rng_state()
+                pilot_gaps = []
+                try:
+                    with freeze_bn_running_stats(self.model):
+                        for task in train_batch:
+                            pilot_gaps.append(self.pilot_generalization_gap(
+                                task=task,
+                                model=self.model,
+                                loss=loss,
+                                adaptation_steps=adaptation_steps,
+                                inner_lr=fast_lr,
+                            ))
+                finally:
+                    restore_rng_state(rng_state)
+
+                task_weights, ggm_stats = compute_ggm_rw_weights(
+                    gaps=pilot_gaps,
+                    epoch=ep,
+                    batch_size=meta_batch_size,
+                    temperature=cfg.get('task_weight_temperature', 1.0),
+                    alpha_max=cfg.get('task_weight_alpha_max', 0.20),
+                    warmup_epochs=cfg.get('task_weight_warmup_epochs', 50),
+                    z_clip=cfg.get('task_weight_z_clip', 2.0),
+                    max_ratio=cfg.get('task_weight_max_ratio', 3.0),
+                    eps=cfg.get('task_weight_eps', 1e-6),
+                )
+            else:
+                task_weights = None
+                ggm_stats = None
+
+            for task_idx, task in enumerate(train_batch):
+                learner = maml.clone()
+                evaluation_error, evaluation_accuracy, _, _ = self.fast_adapt(
+                    task, learner, loss, adaptation_steps
+                )
+                if weighting_mode == 'ggm_rw':
+                    weighted_error = task_weights[task_idx] * evaluation_error
+                    weighted_error.backward()
+                else:
+                    evaluation_error.backward()
+                meta_train_error += evaluation_error.item()
+                meta_train_accuracy += evaluation_accuracy.item()
+
+            for _ in range(meta_batch_size):
+                learner = maml.clone()
+                task = valid_tasks.sample()
+                evaluation_error, evaluation_accuracy, _, _ = self.fast_adapt(
+                    task, learner, loss, adaptation_steps
+                )
+                meta_valid_error += evaluation_error.item()
+                meta_valid_accuracy += evaluation_accuracy.item()
+
+            # Standard MAML accumulates B unscaled task losses and divides the
+            # resulting gradients by B. GGM weights already sum to one, so an
+            # additional division would make its effective learning rate B times smaller.
+            if weighting_mode == 'none':
+                for p in maml.parameters():
+                    if p.grad is not None:
+                        p.grad.data.mul_(1.0 / meta_batch_size)
+
+            # Clip the fully aggregated outer gradient for both none and GGM-RW.
+            if grad_clip_norm is not None and float(grad_clip_norm) > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    maml.parameters(),
+                    max_norm=float(grad_clip_norm),
+                    error_if_nonfinite=False,
+                )
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    maml.parameters(),
+                    max_norm=float('inf'),
+                    error_if_nonfinite=False,
+                )
+
+            grad_norm_value = float(grad_norm.detach().cpu())
+            if np.isfinite(grad_norm_value):
+                opt.step()
+            else:
+                print(
+                    f'[warn] Epoch {ep + 1}: non-finite outer gradient; '
+                    'optimizer step skipped.'
+                )
+            if scheduler is not None:
+                scheduler.step()
+
+            avg_train_acc = meta_train_accuracy / meta_batch_size
+            avg_valid_acc = meta_valid_accuracy / meta_batch_size
+            avg_train_err = meta_train_error / meta_batch_size
+            avg_valid_err = meta_valid_error / meta_batch_size
+            epoch_seconds = time.time() - t0
+
+            history_row = {
+                'epoch': ep + 1,
+                'train_loss': avg_train_err,
+                'train_acc': avg_train_acc,
+                'valid_loss': avg_valid_err,
+                'valid_acc': avg_valid_acc,
+                'epoch_seconds': epoch_seconds,
+                'outer_lr': current_lr,
+                'outer_grad_norm': grad_norm_value,
+                'best_valid_acc': max(best_valid_acc, avg_valid_acc),
+                'best_epoch': ep + 1 if avg_valid_acc > best_valid_acc else best_epoch,
+                'early_stop_triggered': False,
+                'early_stop_confirmation_episodes': 0,
+                'early_stop_confirmation_loss': '',
+                'early_stop_confirmation_acc': '',
+                'early_stop_confirmed': False,
+                'epochs_without_improvement': 0,
+                'patience_stop_triggered': False,
+            }
+            if ggm_stats is not None:
+                history_row.update({
+                    'ggm_gap_mean': ggm_stats['gap_mean'],
+                    'ggm_gap_std': ggm_stats['gap_std'],
+                    'ggm_weight_min': ggm_stats['weight_min'],
+                    'ggm_weight_max': ggm_stats['weight_max'],
+                    'ggm_alpha': ggm_stats['alpha'],
+                })
+            history.append(history_row)
+
+            epoch_message = (
+                f'Epoch {ep + 1:03d} | '
+                f'time={epoch_seconds:.2f}s | '
+                f'train_loss={avg_train_err:.4f} acc={avg_train_acc:.4f} | '
+                f'valid_loss={avg_valid_err:.4f} acc={avg_valid_acc:.4f} | '
+                f'lr={current_lr:.6f} grad={grad_norm_value:.3f} | '
+                f'best={best_valid_acc:.4f}@{best_epoch}'
+            )
+            if ggm_stats is not None:
+                epoch_message += (
+                    f' | gap={ggm_stats["gap_mean"]:.4f}±{ggm_stats["gap_std"]:.4f} '
+                    f'w=[{ggm_stats["weight_min"]:.4f},{ggm_stats["weight_max"]:.4f}] '
+                    f'alpha={ggm_stats["alpha"]:.4f}'
+                )
+            print(epoch_message)
+
+            if avg_valid_acc > best_valid_acc:
+                best_valid_acc = avg_valid_acc
+                best_epoch = ep + 1
+                os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+                torch.save(self.model.state_dict(), best_path)
+                print(f'  saved best model: {best_path}')
+
+            history_row['epochs_without_improvement'] = ep + 1 - best_epoch
+
+            # A single perfect score from the regular, randomly sampled validation
+            # batch is only a trigger. Confirm it on a larger fresh episode bank
+            # before stopping. Restoring RNG keeps a failed confirmation from
+            # changing the episode sequence of subsequent training epochs.
+            if early_stop_enabled and avg_valid_acc >= early_stop_trigger:
+                history_row['early_stop_triggered'] = True
+                confirmation_rng_state = capture_rng_state()
+                try:
+                    confirmation_loss, confirmation_acc = self.evaluate_meta_tasks(
+                        tasks=valid_tasks,
+                        maml=maml,
+                        loss=loss,
+                        adaptation_steps=adaptation_steps,
+                        num_episodes=early_stop_confirmation_episodes,
+                    )
+                finally:
+                    restore_rng_state(confirmation_rng_state)
+
+                early_stop_confirmed = (
+                    confirmation_acc >= early_stop_confirmation_accuracy
+                )
+                history_row.update({
+                    'epoch_seconds': time.time() - t0,
+                    'early_stop_confirmation_episodes': (
+                        early_stop_confirmation_episodes
+                    ),
+                    'early_stop_confirmation_loss': confirmation_loss,
+                    'early_stop_confirmation_acc': confirmation_acc,
+                    'early_stop_confirmed': early_stop_confirmed,
+                })
+                print(
+                    '  perfect-validation confirmation: '
+                    f'loss={confirmation_loss:.4f} acc={confirmation_acc:.4f} '
+                    f'over {early_stop_confirmation_episodes} episodes '
+                    f'(required>={early_stop_confirmation_accuracy:.4f})'
+                )
+
+                if early_stop_confirmed:
+                    # Save the exact model that passed confirmation even when an
+                    # earlier epoch had already reached the same trigger score.
+                    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+                    torch.save(self.model.state_dict(), best_path)
+                    best_valid_acc = max(best_valid_acc, avg_valid_acc)
+                    best_epoch = ep + 1
+                    history_row['best_valid_acc'] = best_valid_acc
+                    history_row['best_epoch'] = best_epoch
+                    print(
+                        f'  early stopping confirmed at epoch {ep + 1}; '
+                        f'saved model: {best_path}'
+                    )
+                    break
+
+                print('  confirmation below threshold; training continues.')
+
+            if patience and ep + 1 - best_epoch >= patience:
+                history_row['patience_stop_triggered'] = True
+                print(
+                    f'  early stopping: validation accuracy has not improved for '
+                    f'{patience} epochs; stopped at epoch {ep + 1}; '
+                    f'best={best_valid_acc:.4f}@{best_epoch}; using {best_path}'
+                )
+                break
+
+        _save_training_history(history, save_path, cfg)
+        return best_path
+
+    def test(self, load_path, inner_steps=10, shots=1, meta_batch_size=None):
+        if self.method == 'resnet18':
+            from supervised_training import test_supervised
+            return test_supervised(self, load_path)
+        metadata_path = str(load_path) + '.config.json'
+        if os.path.exists(metadata_path):
+            with open(metadata_path, encoding='utf-8') as stream:
+                saved = json.load(stream)
+            if saved.get('method', 'configured_maml') != self.method:
+                raise ValueError('Checkpoint method differs from config method')
+        try:
+            state = torch.load(load_path, map_location=device, weights_only=True)
+        except TypeError:
+            state = torch.load(load_path, map_location=device)
+        self.model.load_state_dict(state)
+        self.model.to(device)
+
+        cfg = self.pu_config
+        queries = cfg.get('q_query', 1)
+        fast_lr = cfg.get('inner_lr', 0.05)
+        test_tasks = self.build_tasks('test', self.ways, shots, queries, 1000)
+        class_names = list(self._get_pu_storage().source_classes)
+        maml = self._algorithm()
+        loss = torch.nn.CrossEntropyLoss(reduction='mean')
+
+        meta_batch_size = meta_batch_size or cfg.get('test_meta_batch_size', 100)
+        meta_test_error = 0.0
+        meta_test_accuracy = 0.0
+        all_features = []
+        all_true = []
+        all_pred = []
+        prediction_rows = []
+        t0 = time.time()
+
+        for episode_idx in range(meta_batch_size):
+            learner = maml.clone()
+            if hasattr(test_tasks, 'sample_with_original_labels'):
+                full_task = test_tasks.sample_with_original_labels()
+                task = full_task[:4]
+                query_orig_labels = full_task[5].cpu().numpy()
+                chosen_orig_labels = full_task[6].cpu().numpy()
+            else:
+                task = test_tasks.sample()
+                query_orig_labels = None
+                chosen_orig_labels = None
+
+            evaluation_error, evaluation_accuracy, features, query_labels, predictions = self.fast_adapt(
+                task, learner, loss, inner_steps, return_predictions=True
+            )
+            meta_test_error += evaluation_error.item()
+            meta_test_accuracy += evaluation_accuracy.item()
+
+            pred_local = predictions.detach().argmax(dim=1).cpu().numpy()
+            true_local = query_labels.detach().cpu().numpy()
+
+            if chosen_orig_labels is not None and query_orig_labels is not None:
+                pred_orig = chosen_orig_labels[pred_local]
+                true_orig = query_orig_labels
+            else:
+                pred_orig = pred_local
+                true_orig = true_local
+
+            all_features.append(features.detach().cpu().numpy())
+            all_true.append(true_orig.astype(np.int64))
+            all_pred.append(pred_orig.astype(np.int64))
+
+            for sample_idx, (tl, pl, to, po) in enumerate(zip(true_local, pred_local, true_orig, pred_orig)):
+                prediction_rows.append({
+                    'episode': episode_idx,
+                    'sample': sample_idx,
+                    'true_local_label': int(tl),
+                    'pred_local_label': int(pl),
+                    'true_class_index': int(to),
+                    'pred_class_index': int(po),
+                    'true_class_name': class_names[int(to)] if int(to) < len(class_names) else str(to),
+                    'pred_class_name': class_names[int(po)] if int(po) < len(class_names) else str(po),
+                })
+
+        print(
+            f'Test {self.ways}-way {shots}-shot {queries}-query | '
+            f'tasks={meta_batch_size} | time={time.time() - t0:.2f}s'
+        )
+        label = 'FT' if self.method in ('resnet18_ft', 'tl_wdcnn') else 'Meta'
+        print(f'{label} Test Error: {meta_test_error / meta_batch_size:.4f}')
+        print(f'{label} Test Accuracy: {meta_test_accuracy / meta_batch_size:.4f}')
+
+        if all_features:
+            tsne_payload = self.fixed_selected_class_tsne_payload(
+                inner_steps=inner_steps,
+                shots=shots,
+            )
+            _save_test_visualizations(
+                features=np.concatenate(all_features, axis=0),
+                y_true=np.concatenate(all_true, axis=0),
+                y_pred=np.concatenate(all_pred, axis=0),
+                rows=prediction_rows,
+                class_names=class_names,
+                load_path=load_path,
+                cfg=cfg,
+                tsne_payload=tsne_payload,
+            )
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Train/test STFT-CNN4-MAML baseline.')
+    parser.add_argument('--train', action='store_true')
+    parser.add_argument('--test', action='store_true')
+    parser.add_argument('--quick', action='store_true')
+    default_model_name = PU_CONFIG.get('model_name', 'STFT_CNN4_MAML')
+    parser.add_argument('--model_path', default=os.path.join('.', 'model_save', default_model_name))
+    args = parser.parse_args()
+    if not args.train and not args.test:
+        mode = PU_CONFIG.get('run_mode', 'train_test')
+        args.train = mode in ('train', 'train_test')
+        args.test = mode in ('test', 'train_test')
+    print(f"Method: {PU_CONFIG.get('method', 'configured_maml')}")
+
+    seed_torch(PU_CONFIG.get('seed', 24))
+    print(f'Device: {device}')
+    if PU_CONFIG.get('method') == 'tl_wdcnn':
+        print(f"Input shape: [batch, 1, {PU_CONFIG['window_size']}] (raw vibration)")
+    else:
+        print(f"Input shape: [batch, {PU_CONFIG['in_channels']}, "
+              f"{PU_CONFIG['img_size']}, {PU_CONFIG['img_size']}] (STFT)")
+    print(f'Backbone: {PU_CONFIG.get("backbone", "cnn4")}')
+    print(f'Frequency module: {PU_CONFIG.get("frequency_module", "none")}')
+    print(f'Denoise module: {PU_CONFIG.get("denoise_module", "none")}')
+    print(f'Attention module: {PU_CONFIG.get("attention_module", "none")}')
+    print(f'Task weighting: {PU_CONFIG.get("task_weighting_mode", "none")}')
+    print(
+        f'Classification preset: {PU_CONFIG.get("classification_preset")} | '
+        f'pool={len(PU_CONFIG.get("class_groups", {}))} classes'
+    )
+
+    net = MAML_learner(ways=PU_CONFIG['n_way'], pu_config=PU_CONFIG)
+    shots = PU_CONFIG['k_shot']
+    quick = args.quick or QUICK_TEST
+
+    if args.train:
+        best_path = net.train(args.model_path, shots=shots, quick_test=quick)
+    else:
+        best_path = args.model_path + '_best'
+
+    if args.test:
+        if not os.path.exists(best_path):
+            raise FileNotFoundError(f'Model not found: {best_path}')
+        net.test(
+            best_path,
+            inner_steps=PU_CONFIG.get('test_inner_steps', 10),
+            shots=shots,
+            meta_batch_size=4 if quick else None,
+        )
+
+    if not args.train and not args.test:
+        print('Nothing to do. Use --train and/or --test.')
+
+
+if __name__ == '__main__':
+    main()
