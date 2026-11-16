@@ -66,7 +66,12 @@ class RecordedMetaDataset(MetaDataset):
 
 class ProjectData:
     def __init__(self, cfg: dict, output: Path | None = None) -> None:
-        if cfg['input_representation'] == REPRESENTATION:
+        if cfg['dataset'] == 'hust_huazhong':
+            from hust_huazhong_inputs import storage_for
+            storage = storage_for(cfg)
+            if output and hasattr(storage, 'window_manifest'):
+                save_json(output / 'raw_window_manifest.json', storage.window_manifest)
+        elif cfg['input_representation'] == REPRESENTATION:
             storage = PaperRawDataset(cfg)
             if output:
                 save_json(output / 'raw_window_manifest.json', storage.window_manifest)
@@ -241,9 +246,10 @@ def train_one(cfg: dict, method: MethodConfig, device: torch.device, out: Path) 
                 break
         model.load_state_dict(torch.load(out / 'best.pt', map_location=device, weights_only=True))
         seed_all(100000 + cfg['seed'])
-        result = evaluate(model, data, cfg, method, device, 'test',
-                          cfg['test_meta_batch_size'], cfg['test_inner_steps'], out)
-        result.update(status='SMOKE_ONLY' if cfg['smoke'] else 'OK', dataset=cfg['dataset'],
+        result = {} if cfg.get('train_only', False) else evaluate(
+            model, data, cfg, method, device, 'test',
+            cfg['test_meta_batch_size'], cfg['test_inner_steps'], out)
+        result.update(status='TRAINED' if cfg.get('train_only', False) else ('SMOKE_ONLY' if cfg['smoke'] else 'OK'), dataset=cfg['dataset'],
                       task=cfg['task'], seed=cfg['seed'], shot=cfg['k_shot'],
                       method=f"MFEML-{cfg['input_tag']}-project-reconstruction", best_epoch=best_epoch,
                       input_representation=cfg['input_representation'], input_mode=cfg['input_mode'],

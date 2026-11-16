@@ -1,33 +1,25 @@
-# PU / CWRU few-shot bearing fault diagnosis
+> 2026-10-19 更新：华中HUST已通过独立入口 run_hust_huazhong.py 接入，采用目标验证，见[HUST说明](../docs/运行说明/HUST华中科技大学_运行说明.md)。下文“第三库尚未接入”为历史记录，已被本更新取代；run_experiment.py仍用于CWRU/PU。
 
-Current research project snapshot, including configurable MAML and metric baselines, supervised ResNet18, transfer baselines, and CWRU AWGN evaluation.
+# CWRU / PU 独立跨工况实验
 
-## Entry points
+当前统一入口为 `run_experiment.py`，复用已有模型、数据加载器和训练器。
 
-- PU: `python maml_train_pic.py`, configured in `config_pu.py`.
-- CWRU: `python run_cwru_maml.py`, configured in `config_cwru.py`.
-- CWRU noise-only evaluation: `python run_cwru_maml.py --noise-test` (requires matching trained weights).
+```bash
+python run_experiment.py --dataset cwru --tasks all --method scg_maml --input stft --shots 1 --seed 3 --action train-test --device cuda
+python run_experiment.py --dataset pu --tasks P1,P3 --method maml --input nostft --shots 5 --seed 24 --action train-test --device cuda
+```
 
-`method` selects configured_maml, maml, protonet, matchingnet, relationnet, resnet18, resnet18_ft, or tl_wdcnn. `run_mode` selects train, test, or train_test. Check current configuration before running; this snapshot preserves local experiment settings.
+方法：`protonet matchingnet relationnet maml amaml tubr_ml mfeml scg_maml`；`tl_wdcnn` 为补充方法。`a0 a1 a2 a3` 为 STFT 1-shot 消融。
+SCG-MAML 和消融仅支持 STFT；其他模型的 nostft 保持原生输入。支持 1/3/5-shot，默认 5-way、15 query、1000 测试 episode。
 
-## Environment and data
+默认训练500轮，对比方法 patience=100；SCG-MAML/A0–A3 不启用早停。TL-WDCNN 监督预训练上限100轮。只有 `--action train-test` 执行完整训练和测试；默认 action=check，smoke 仅作功能验证。
 
-Validated locally with Python/PyTorch in the ifmaml2 environment (PyTorch 2.4.1). Runtime imports include NumPy, SciPy, OpenCV, scikit-learn and matplotlib. The repository includes a local MAML shim; the model implementation does not require downloading pretrained ImageNet weights.
+新结果在 `experiment_results/`，按数据集/实验类型/输入/模型/shot/批次/seed/任务分别保存。正式统计只汇总完整的 seed 3/24/38，缺失组标为 incomplete。
 
-Supply your own local PU/CWRU MAT data and adjust paths in configuration. Original datasets, generated STFT images, model weights and experiment outputs are not included. CWRU source lookup metadata is included at `CWRU/__file__/metadata.txt`.
+完整命令见 [独立数据集正式实验命令](../docs/运行说明/独立数据集_正式实验命令.md)，服务器上传见 [部署清单](../docs/运行说明/AutoDL服务器部署清单.md)。
 
-CWRU preprocessing: `python run_cwru_maml.py --preprocess`. Follow the data paths and preparation details in the project documentation. Do not use an old checkpoint with a different task or preprocessing protocol.
+跨数据集与河内理工大学 HUST 已退出当前入口。华中科技大学 HUST 使用独立的 `run_hust_huazhong.py` 入口及 `hust_huazhong` 数据配置，支持 H1–H6 单源到单目标、目标域验证实验。
 
-## Documentation
+兼容入口 `maml_train_pic.py`、`run_cwru_maml.py`、`run_table_row.py` 和三个独立复现入口保留；其历史默认配置不自动变成统一入口的设置。噪声测试、监督/迁移基线及旧模型组件保留兼容。上传代码时必须包含 `optional_models/`。
 
-- [仓库首页与跨数据集入口](../README.md)
-- [经典模型配置](../docs/运行说明/经典模型配置使用说明.md)
-- [普通ResNet18](../docs/运行说明/普通ResNet18配置使用说明.md)
-- [迁移学习模型](../docs/运行说明/迁移学习模型配置使用说明.md)
-- [CWRU噪声测试](../docs/运行说明/CWRU噪声测试使用说明.md)
-
-Current operational documentation is under `../docs/运行说明/`; older repository documentation is retained under `../docs/历史说明/`. Private research notes and local progress records are not published.
-
-## Functional checks
-
-Run `test_classic_interfaces.py`, `test_transfer_interfaces.py`, `test_supervised_resnet18.py`, or `test_cwru_noise.py` in the configured environment with local data available. These use temporary smoke-test weights, not formal experiment results.
+原始 CWRU/PU 数据及历史正式结果保留。旧权重应使用对应源码快照补测，不能忽略源码或数据哈希不一致。

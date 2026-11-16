@@ -881,14 +881,16 @@ class MAML_learner(object):
                 meta_train_error += evaluation_error.item()
                 meta_train_accuracy += evaluation_accuracy.item()
 
-            for _ in range(meta_batch_size):
-                learner = maml.clone()
-                task = valid_tasks.sample()
-                evaluation_error, evaluation_accuracy, _, _ = self.fast_adapt(
-                    task, learner, loss, adaptation_steps
-                )
-                meta_valid_error += evaluation_error.item()
-                meta_valid_accuracy += evaluation_accuracy.item()
+            # Opt-in HUST evaluation timing; legacy PU behavior stays unchanged.
+            if not cfg.get('validate_after_update', False):
+                for _ in range(meta_batch_size):
+                    learner = maml.clone()
+                    task = valid_tasks.sample()
+                    evaluation_error, evaluation_accuracy, _, _ = self.fast_adapt(
+                        task, learner, loss, adaptation_steps
+                    )
+                    meta_valid_error += evaluation_error.item()
+                    meta_valid_accuracy += evaluation_accuracy.item()
 
             # Standard MAML accumulates B unscaled task losses and divides the
             # resulting gradients by B. GGM weights already sum to one, so an
@@ -922,6 +924,17 @@ class MAML_learner(object):
                 )
             if scheduler is not None:
                 scheduler.step()
+
+            if cfg.get('validate_after_update', False):
+                for _ in range(meta_batch_size):
+                    learner = maml.clone()
+                    task = valid_tasks.sample()
+                    evaluation_error, evaluation_accuracy, _, _ = self.fast_adapt(
+                        task, learner, loss, adaptation_steps
+                    )
+                    meta_valid_error += evaluation_error.item()
+                    meta_valid_accuracy += evaluation_accuracy.item()
+
 
             avg_train_acc = meta_train_accuracy / meta_batch_size
             avg_valid_acc = meta_valid_accuracy / meta_batch_size

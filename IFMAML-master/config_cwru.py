@@ -105,7 +105,8 @@ CWRU_CONFIG = {
     'ft_pretrain_max_batches': 0,  # 0=每轮遍历全部源样本；正数仅用于限量调试
     'ft_validation_episodes': 16,
     'ft_validation_seed': 2026,    # 每轮固定验证任务与局部头初始化
-    'ft_patience': 0,             # 0=不提前停止；正数为验证无提升轮数
+    'ft_patience': 100,           # 连续100轮验证无提升早停；0关闭
+    'early_stop_patience': 100,   # 元学习模型同样启用无提升早停
     'ft_steps': 10,               # support微调步数，与MAML inner_steps独立
     'ft_lr': 0.01,
     'ft_scope': 'all',            # all=全网微调；head=冻结编码器仅训练新头
@@ -291,7 +292,7 @@ CWRU_CONFIG = {
     # ==================== 满分验证提前停止 ====================
     # 常规validation达到触发阈值后，追加更大规模确认验证；确认通过才提前停止，
     # 随后run_cwru_maml.py仍会加载_best执行最终1000-episode test。
-    'early_stop_on_perfect_validation': True,
+    'early_stop_on_perfect_validation': False,  # 统一使用无提升patience早停
 
     # 常规16-episode validation全部正确时触发确认。
     'early_stop_trigger_accuracy': 1.0,

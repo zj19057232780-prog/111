@@ -1,0 +1,354 @@
+# AutoDL服务器：三数据集单模型实验命令清单
+
+> 2026-11-10早停更新：PU/CWRU/HUST所有少样本模型（含完整模型及消融）默认patience=100，连续100轮验证准确率无严格提升后停止，train-test测试最佳权重；--patience 0关闭。下文历史“PU/CWRU完整模型及消融不早停”描述已失效。新启动任务生效，已运行进程不自动更新。
+
+> 2026-11-10更新：PU/CWRU及华中HUST除TUBR-ML外所有模型均可使用3-shot，包含A0–A3和cnn4/lsk/lsk_gc/full。将适用命令的 --shots 1 改为 --shots 3 即可，保留15-query。HUST --models all --shots 3自动排除TUBR-ML；原有STFT/nostft限制不变。下文旧“只支持1/5-shot”和“A0–A3仅1-shot”描述以本条为准；TUBR-ML既有1/5-shot限制保持不变。
+
+更新：2026-10-23。对应本地《三数据集_单模型实验命令清单.md》，按当前入口参数核对。以下是正式训练和测试命令，按需选择单条运行；本次未连接服务器或启动训练。
+
+## 运行前：AutoDL终端执行一次
+
+```bash
+cd /root/autodl-tmp/ifmaml/IFMAML-master
+export OMP_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+export PYTHONUNBUFFERED=1
+mkdir -p logs
+python -c "import sys, torch; print('Python:', sys.executable); print('CUDA:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'unavailable')"
+```
+
+若显示CUDA不可用，先切换到服务器已安装CUDA版PyTorch的环境；不要照搬本地的ifmaml2环境名称。以下使用当前环境的python。
+
+服务器目录应保持：
+```text
+/root/autodl-tmp/ifmaml/
+├── IFMAML-master/
+│   ├── run_experiment.py
+│   ├── run_hust_huazhong.py
+│   ├── CWRU/
+│   ├── pu_data_processed/
+│   ├── pu_data_mat/
+│   └── HUST-bearing-dataset/
+└── comparison_models/
+    ├── mu2025_amaml/
+    ├── wang2025_tubr_ml/
+    └── li2025_mfeml/
+```
+
+AMAML、TUBR-ML、MFEML需要整个comparison_models及其必要依赖文件，不能只上传IFMAML-master。截图能确认部分数据/缓存目录存在，不能确认原始数据完整或服务器代码已更新。
+
+本清单显式指定服务器数据路径：CWRU STFT用--raw-root生成各任务缓存，PU STFT用--data-root读取现有图像；nostft改用各自原始MAT根目录。HUST使用华中科技大学数据HUST-bearing-dataset；若实际位置不同，只需替换--raw-root的路径。HUST缓存会按入口逻辑校验或生成，旧Windows缓存不保证可直接复用。
+
+**轮数说明：** 保留原附件的设置：HUST的MAML、nostft、全任务三seed那一条为50轮，其余大多数命令为500轮。若希望统一预算，须在运行前主动统一--epochs；不要把50轮与500轮结果当成相同预算。
+
+| 数据集 | 入口 | 任务 | 多任务三seed运行量 |
+|---|---|---|---|
+| CWRU | run_experiment.py --dataset cwru | C0 C1 C2 C3 | 每模型12次训练 |
+| PU | run_experiment.py --dataset pu | P1 P2 P3 P4 | 每模型12次训练 |
+| 华中HUST | run_hust_huazhong.py | H1 H2 H3 H4 H5 H6 | 每模型18次训练 |
+
+下列默认1-shot、STFT、500轮、5-way、15-query、1000测试episodes。HUST默认X通道，使用目标域验证；支持STFT/nostft，SCG-MAML仅STFT。
+
+CWRU/PU的常规对比方法patience=100，SCG-MAML及A0–A3不早停；TL-WDCNN监督预训练上限100轮。HUST全部模型（含完整SCG-MAML）默认patience100，可用 --patience 0 关闭。早停启用的模型不一定训练到500轮。
+
+## 一、单模型 × 单任务 × 单seed
+
+每条只训练一次，示例固定seed3；改成24或38即可。
+
+### CWRU
+
+```bash
+# ProtoNet
+python -u run_experiment.py --dataset cwru --method protonet --tasks C0 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+
+# MatchingNet
+python -u run_experiment.py --dataset cwru --method matchingnet --tasks C0 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+
+# RelationNet
+python -u run_experiment.py --dataset cwru --method relationnet --tasks C0 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+
+# MAML
+python -u run_experiment.py --dataset cwru --method maml --tasks C0 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+
+# AMAML
+python -u run_experiment.py --dataset cwru --method amaml --tasks C0 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+
+# TUBR-ML
+python -u run_experiment.py --dataset cwru --method tubr_ml --tasks C0 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+
+# MFEML
+python -u run_experiment.py --dataset cwru --method mfeml --tasks C0 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+
+# SCG-MAML完整模型
+python -u run_experiment.py --dataset cwru --method scg_maml --tasks C0 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+
+# TL-WDCNN（补充）
+python -u run_experiment.py --dataset cwru --method tl_wdcnn --tasks C0 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+
+```
+
+### PU
+
+```bash
+# ProtoNet
+python -u run_experiment.py --dataset pu --method protonet --tasks P1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+
+# MatchingNet
+python -u run_experiment.py --dataset pu --method matchingnet --tasks P1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+
+# RelationNet
+python -u run_experiment.py --dataset pu --method relationnet --tasks P1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+
+# MAML
+python -u run_experiment.py --dataset pu --method maml --tasks P1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+
+# AMAML
+python -u run_experiment.py --dataset pu --method amaml --tasks P1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+
+# TUBR-ML
+python -u run_experiment.py --dataset pu --method tubr_ml --tasks P1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+
+# MFEML
+python -u run_experiment.py --dataset pu --method mfeml --tasks P1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+
+# SCG-MAML完整模型
+python -u run_experiment.py --dataset pu --method scg_maml --tasks P1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+
+# TL-WDCNN（补充）
+python -u run_experiment.py --dataset pu --method tl_wdcnn --tasks P1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+
+```
+
+### 华中科技大学HUST
+
+以下每条只跑一个模型；默认15-query，所有HUST模型（含完整模型）默认patience100。
+
+**stft 输入**
+
+```bash
+python -u run_hust_huazhong.py --model protonet --tasks H1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model matchingnet --tasks H1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model relationnet --tasks H1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model maml --tasks H1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model tl_wdcnn --tasks H1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model amaml --tasks H1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model tubr_ml --tasks H1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model mfeml --tasks H1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model full --tasks H1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+```
+
+**nostft 输入**
+
+```bash
+python -u run_hust_huazhong.py --model protonet --tasks H1 --seed 3 --input nostft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model matchingnet --tasks H1 --seed 3 --input nostft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model relationnet --tasks H1 --seed 3 --input nostft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model maml --tasks H1 --seed 3 --input nostft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model tl_wdcnn --tasks H1 --seed 3 --input nostft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model amaml --tasks H1 --seed 3 --input nostft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model tubr_ml --tasks H1 --seed 3 --input nostft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model mfeml --tasks H1 --seed 3 --input nostft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+```
+
+## 二、单模型 × 多任务 × 多seed
+
+每条执行该模型全部任务×seed3/24/38：CWRU/PU为4任务、12次训练；HUST为6任务、18次训练，并在同一批次汇总。
+
+### CWRU
+
+```bash
+# ProtoNet
+python -u run_experiment.py --dataset cwru --method protonet --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+
+# MatchingNet
+python -u run_experiment.py --dataset cwru --method matchingnet --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+
+# RelationNet
+python -u run_experiment.py --dataset cwru --method relationnet --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+
+# MAML
+python -u run_experiment.py --dataset cwru --method maml --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+
+# AMAML
+python -u run_experiment.py --dataset cwru --method amaml --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+
+# TUBR-ML
+python -u run_experiment.py --dataset cwru --method tubr_ml --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+
+# MFEML
+python -u run_experiment.py --dataset cwru --method mfeml --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+
+# SCG-MAML完整模型
+python -u run_experiment.py --dataset cwru --method scg_maml --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+
+# TL-WDCNN（补充）
+python -u run_experiment.py --dataset cwru --method tl_wdcnn --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+
+```
+
+### PU
+
+```bash
+# ProtoNet
+python -u run_experiment.py --dataset pu --method protonet --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+
+# MatchingNet
+python -u run_experiment.py --dataset pu --method matchingnet --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+
+# RelationNet
+python -u run_experiment.py --dataset pu --method relationnet --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+
+# MAML
+python -u run_experiment.py --dataset pu --method maml --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+
+# AMAML
+python -u run_experiment.py --dataset pu --method amaml --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+
+# TUBR-ML
+python -u run_experiment.py --dataset pu --method tubr_ml --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+
+# MFEML
+python -u run_experiment.py --dataset pu --method mfeml --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+
+# SCG-MAML完整模型
+python -u run_experiment.py --dataset pu --method scg_maml --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+
+# TL-WDCNN（补充）
+python -u run_experiment.py --dataset pu --method tl_wdcnn --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+
+```
+
+### 华中科技大学HUST
+
+以下每条只跑一个模型；默认15-query，所有HUST模型（含完整模型）默认patience100。
+
+**stft 输入**
+
+```bash
+python -u run_hust_huazhong.py --model protonet --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model matchingnet --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model relationnet --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model maml --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model tl_wdcnn --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model amaml --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model tubr_ml --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model mfeml --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model full --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+```
+
+**nostft 输入**
+
+```bash
+python -u run_hust_huazhong.py --model protonet --tasks all --seeds 3 24 38 --input nostft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model matchingnet --tasks all --seeds 3 24 38 --input nostft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model relationnet --tasks all --seeds 3 24 38 --input nostft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model maml --tasks all --seeds 3 24 38 --input nostft --shots 1 --epochs 50 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model tl_wdcnn --tasks all --seeds 3 24 38 --input nostft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model amaml --tasks all --seeds 3 24 38 --input nostft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model tubr_ml --tasks all --seeds 3 24 38 --input nostft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+python -u run_hust_huazhong.py --model mfeml --tasks all --seeds 3 24 38 --input nostft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+```
+
+## 三、只选几个任务 / 只选几个seed
+
+模型仍然只有一个。任务用空格分开，seed也用空格；以下每条是2任务×2seed，共4次训练。
+
+```bash
+python -u run_experiment.py --dataset cwru --method scg_maml --tasks C0 C3 --seeds 3 24 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+python -u run_experiment.py --dataset pu --method scg_maml --tasks P1 P4 --seeds 3 24 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+python -u run_hust_huazhong.py --model full --tasks H1 H4 --seeds 3 24 --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+```
+
+单模型、多任务、单seed：把上面 `--seeds 3 24` 改成 `--seed 3`。单模型、单任务、多seed：把 `--tasks C0 C3` 改成 `--tasks C0`（另两库同理）。
+
+## 四、1/5-shot与输入切换
+
+- 三库常规实验：把 `--shots 1` 改为 `--shots 5`。CWRU/PU还支持3-shot，HUST只支持1/5-shot。
+- CWRU/PU常规对比方法切换原生输入时：改为 `--input nostft`；CWRU同时将 `--raw-root` 改为 `--data-root`（仍指向CWRU），PU同时将 `--data-root` 从pu_data_processed改为pu_data_mat。模型保持各自原生长度/形状。
+- CWRU/PU的SCG-MAML和A0–A3只支持STFT；HUST的cnn4/lsk/lsk_gc/full为STFT配置；原生CNN4请用 `--model maml --input nostft`。
+
+例如单模型全部任务、三seed、5-shot、原生输入：
+
+```bash
+python -u run_experiment.py --dataset cwru --method maml --tasks all --seeds 3 24 38 --input nostft --shots 5 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+python -u run_experiment.py --dataset pu --method maml --tasks all --seeds 3 24 38 --input nostft --shots 5 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_mat"
+python -u run_hust_huazhong.py --model full --tasks all --seeds 3 24 38 --shots 5 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+```
+
+## 五、四种配置的名称对应与消融命令
+
+| 配置 | CWRU/PU --method | HUST --model |
+|---|---|---|
+| CNN4-MAML | a0 | cnn4 |
+| LSK-MAML | a1 | lsk |
+| LSK-GC-MAML | a2 | lsk_gc |
+| 完整SCG-MAML | a3（消融）或scg_maml（对比） | full |
+
+CWRU/PU的a0–a3按表格协议限定STFT 1-shot；a3和scg_maml结构相同，分别放入消融与对比结果目录，不必无目的重复训练。HUST四种STFT配置均支持1/5-shot；新对比方法也支持两种shot，唯一例外为TUBR-ML nostft不支持5-shot。
+
+### CWRU：四种消融配置，每行一个模型
+
+```bash
+python -u run_experiment.py --dataset cwru --method a0 --tasks C0 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+python -u run_experiment.py --dataset cwru --method a0 --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+python -u run_experiment.py --dataset cwru --method a1 --tasks C0 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+python -u run_experiment.py --dataset cwru --method a1 --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+python -u run_experiment.py --dataset cwru --method a2 --tasks C0 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+python -u run_experiment.py --dataset cwru --method a2 --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+python -u run_experiment.py --dataset cwru --method a3 --tasks C0 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+python -u run_experiment.py --dataset cwru --method a3 --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/CWRU"
+```
+
+### PU：四种消融配置，每行一个模型
+
+```bash
+python -u run_experiment.py --dataset pu --method a0 --tasks P1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+python -u run_experiment.py --dataset pu --method a0 --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+python -u run_experiment.py --dataset pu --method a1 --tasks P1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+python -u run_experiment.py --dataset pu --method a1 --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+python -u run_experiment.py --dataset pu --method a2 --tasks P1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+python -u run_experiment.py --dataset pu --method a2 --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+python -u run_experiment.py --dataset pu --method a3 --tasks P1 --seed 3 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+python -u run_experiment.py --dataset pu --method a3 --tasks all --seeds 3 24 38 --input stft --shots 1 --epochs 500 --action train-test --device cuda --data-root "/root/autodl-tmp/ifmaml/IFMAML-master/pu_data_processed"
+```
+
+## 六、数据及结果位置
+
+- CWRU：原始数据默认CWRU目录；STFT会生成任务专用缓存到输出根目录/_data，不能用单个工况缓存代替全部任务。
+- PU：STFT默认pu_data_processed，nostft默认pu_data_mat。
+- HUST：原始数据默认HUST-bearing-dataset，STFT缓存默认hust_huazhong_processed/X；入口自动检查或生成缓存。
+- CWRU/PU结果：IFMAML-master/experiment_results/formal/数据集/实验类型/输入/模型/shot/批次/seed/任务。
+- HUST结果：IFMAML-master/hust_huazhong_results/formal/批次/stft或nostft/模型/任务/seed。
+- 同一命令重复执行会创建新批次并重新训练，不会自动接着上次训练。
+- 每任务三个seed齐全才产生mean±样本标准差；完整统计要求同批次全部任务×三seed齐全（CWRU/PU四任务，HUST六任务）。分别启动的单seed命令不会自动跨批次合并；需要直接汇总时使用第二部分的多seed命令。仅两个seed或任务子集时，完整表格标记incomplete，但各次结果照常保存。
+- CWRU/PU批次汇总为summary.json；HUST另有summary.csv和summary.md。全部任务先在每个seed内平均，再计算三seed的mean±std。
+
+对应详细说明：[CWRU/PU](独立数据集_正式实验命令.md)、[华中HUST](HUST华中科技大学_运行说明.md)。本文只整理命令，不启动训练、不修改模型或协议。
+
+## HUST新增接口与限制（2026-10-19）
+
+`--models all --input stft` 运行九个对比方法（含完整模型）；`--models all --input nostft --shots 1` 运行八个原生输入方法。原四种结构消融请明确使用 `--models cnn4 lsk lsk_gc full`。
+
+保持15-query；TUBR-ML原生7056点在目标时间隔离后每类仅17张验证/18张测试，因此nostft 5-shot明确报错，不降低query、不重叠采样。需要原生5-shot批跑时显式排除它：
+
+```bash
+python -u run_hust_huazhong.py --models protonet matchingnet relationnet maml tl_wdcnn amaml mfeml --tasks all --seeds 3 24 38 --input nostft --shots 5 --action train-test --device cuda --raw-root "/root/autodl-tmp/ifmaml/IFMAML-master/HUST-bearing-dataset"
+```
+
+早停按验证准确率严格提升计数；HUST所有模型（含full/scg_maml）均可用 `--patience 100`（默认），连续100轮无提升后停止并测试最佳权重；可用 `--patience 0` 关闭。TL-WDCNN保留既有100轮预训练上限，因此默认patience100通常不会提前触发，可按实验设计显式调小patience。HUST结果新增输入层：formal/批次/stft或nostft/模型/任务/seed。
+
+HUST最新任务（2026-10-20）：H1=20→40，H2=40→20，H3=40→60，H4=60→40，H5=60→80，H6=80→60 Hz。以上HUST `--tasks all` 命令自动覆盖六任务；旧多源任务结果不混用。
+
+
+## 七、实时输出并保存终端日志（可选）
+
+以上命令直接显示训练进程，程序自行保存实验结果。需要另存终端输出时，在所选命令末尾追加：
+
+```bash
+2>&1 | tee "./logs/实验名-$(date +%Y%m%d-%H%M%S).log"
+```
+
+这段是命令后缀，不要单独执行。可先运行 `set -o pipefail`，让管道正确反映训练失败。当前命令以前台方式运行，关闭终端可能中断训练；长实验可在服务器已有的tmux会话中执行。
+
+每条多任务命令按任务/seed顺序运行，同一张GPU建议一次只启动一条。重新执行同一命令会创建新批次并重新训练。
+

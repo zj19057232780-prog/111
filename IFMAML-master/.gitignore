@@ -35,3 +35,11 @@ logs/
 tmp/
 .env
 .env.*
+
+# Unified experiment outputs
+experiment_results/
+
+# Huazhong HUST local artifacts
+HUST-bearing-dataset/
+hust_huazhong_processed/
+hust_huazhong_results/
